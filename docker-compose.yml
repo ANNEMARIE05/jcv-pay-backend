@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jcv
+      POSTGRES_PASSWORD: jcv
+      POSTGRES_DB: jcv_pay
+    ports:
+      - "5433:5432"
+    volumes:
+      - jcv_pg:/var/lib/postgresql/data
+
+volumes:
+  jcv_pg:
