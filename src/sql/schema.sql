@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   description TEXT,
   type TEXT NOT NULL CHECK (type IN ('DIME', 'OFFRANDE', 'COTISATION', 'PROJET', 'EVENEMENT', 'EPARGNE', 'LIBRE')),
   montant INTEGER NOT NULL CHECK (montant > 0),
-  statut TEXT NOT NULL CHECK (statut IN ('VALIDE', 'EN_ATTENTE', 'REJETE', 'ANNULE')),
+  statut TEXT NOT NULL CHECK (statut IN ('VALIDE', 'EN_ATTENTE', 'REJETE', 'ANNULE', 'ECHEC')),
   moyen_paiement TEXT NOT NULL CHECK (moyen_paiement IN ('WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE', 'VIREMENT', 'ESPECES')),
   projet_id UUID REFERENCES projets(id) ON DELETE SET NULL,
   evenement_id UUID REFERENCES evenements(id) ON DELETE SET NULL,

@@ -6,6 +6,7 @@ import { buildEspace, notify } from '../services/espace.js';
 import { presentMouvement, presentUser } from '../services/present.js';
 import { deleteCaisse, nextMatricule, recordCash, setPaymentStatus, transferCaisse, withdraw } from '../services/payments.js';
 import { getGeniusBalance } from '../services/geniuspay.js';
+import { auditLog } from '../services/audit.js';
 import { hashPassword } from '../utils/auth.js';
 import { cleanEmail, formatPhone, normalizePhone } from '../utils/phone.js';
 import { money, randomDigits } from '../utils/codes.js';
@@ -192,6 +193,14 @@ router.post(
   requireMoney,
   asyncHandler(async (req, res) => {
     await setPaymentStatus(req.user, req.params.id, 'VALIDE');
+    await auditLog({
+      acteurId: req.user.id,
+      acteurRole: req.user.role,
+      action: 'PAIEMENT_VALIDE',
+      cibleType: 'transaction',
+      cibleId: req.params.id,
+      ip: req.ip,
+    });
     res.json(await buildEspace(req.user));
   })
 );
@@ -202,6 +211,14 @@ router.post(
   requireMoney,
   asyncHandler(async (req, res) => {
     await setPaymentStatus(req.user, req.params.id, 'REJETE');
+    await auditLog({
+      acteurId: req.user.id,
+      acteurRole: req.user.role,
+      action: 'PAIEMENT_REJETE',
+      cibleType: 'transaction',
+      cibleId: req.params.id,
+      ip: req.ip,
+    });
     res.json(await buildEspace(req.user));
   })
 );
@@ -239,7 +256,7 @@ router.get(
 router.post(
   '/fideles',
   requireAuth,
-  requireCampaigns,
+  requirePeople,
   asyncHandler(async (req, res) => {
     const prenom = String(req.body.prenom || '').trim();
     const nom = String(req.body.nom || '').trim();

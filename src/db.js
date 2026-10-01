@@ -10,8 +10,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const pool = new Pool({ connectionString: config.databaseUrl });
 
 export async function migrate() {
-  const sql = fs.readFileSync(path.join(__dirname, 'sql', 'schema.sql'), 'utf8');
-  await pool.query(sql);
+  const sqlDir = path.join(__dirname, 'sql');
+  const schema = fs.readFileSync(path.join(sqlDir, 'schema.sql'), 'utf8');
+  const security = fs.readFileSync(path.join(sqlDir, 'security.sql'), 'utf8');
+  await pool.query(schema);
+  await pool.query(security);
 }
 
 export async function withTx(fn) {

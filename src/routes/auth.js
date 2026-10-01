@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { pool } from '../db.js';
 import { AppError, asyncHandler } from '../errors.js';
 import { requireAuth } from '../middleware/auth.js';
+import { passwordResetLimiter } from '../middleware/security.js';
+import { auditLog } from '../services/audit.js';
 import { presentUser } from '../services/present.js';
 import { buildEspace } from '../services/espace.js';
 import { nextMatricule } from '../services/payments.js';
@@ -70,8 +72,22 @@ router.post(
     }
 
     if (!user || !user.actif || !(await verifyPassword(password, user.mot_de_passe_hash))) {
+      // Audit des tentatives échouées
+      await auditLog({
+        acteurId: user?.id,
+        action: 'CONNEXION_ECHEC',
+        details: `Identifiant: ${identifiant.slice(0, 30)}`,
+        ip: req.ip,
+      });
       throw new AppError(401, 'Identifiants incorrects.');
     }
+
+    await auditLog({
+      acteurId: user.id,
+      acteurRole: user.role,
+      action: 'CONNEXION_OK',
+      ip: req.ip,
+    });
 
     res.json({
       token: signToken(user),
@@ -136,6 +152,7 @@ router.post(
 
 router.post(
   '/mot-de-passe/demande',
+  passwordResetLimiter,
   asyncHandler(async (req, res) => {
     const phoneNorm = normalizePhone(req.body.telephone);
     const { rows } = await pool.query('SELECT * FROM utilisateurs WHERE telephone_norm = $1', [phoneNorm]);
@@ -157,6 +174,7 @@ router.post(
 
 router.post(
   '/mot-de-passe/reinitialiser',
+  passwordResetLimiter,
   asyncHandler(async (req, res) => {
     const phoneNorm = normalizePhone(req.body.telephone);
     const code = String(req.body.code || '').trim();

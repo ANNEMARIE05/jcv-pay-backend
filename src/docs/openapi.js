@@ -480,7 +480,7 @@ export const openApiDocument = {
         tags: ['Utilisateurs'],
         summary: 'Créer un fidèle',
         description:
-          'Réservé à `SUPER_ADMIN`, `ADMINISTRATEUR` et `TRESORIER`. Le compte est créé avec le rôle `MEMBRE` et un mot de passe temporaire.',
+          'Réservé à `SUPER_ADMIN` et `ADMINISTRATEUR`. Le compte est créé avec le rôle `MEMBRE` et un mot de passe temporaire.',
         security: bearer,
         requestBody: json('Fidèle.', { $ref: '#/components/schemas/NouveauFidele' }),
         responses: {
@@ -617,7 +617,7 @@ export const openApiDocument = {
       },
       StatutPaiement: {
         type: 'string',
-        enum: ['VALIDE', 'EN_ATTENTE', 'REJETE', 'ANNULE'],
+        enum: ['VALIDE', 'EN_ATTENTE', 'REJETE', 'ANNULE', 'ECHEC'],
       },
       SourceCaisse: {
         type: 'string',

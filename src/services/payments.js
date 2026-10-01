@@ -17,10 +17,12 @@ const GATEWAY_TO_LOCAL = {
   wave: 'WAVE',
   orange_money: 'ORANGE_MONEY',
   mtn_money: 'MTN_MOMO',
+  mtn_momo: 'MTN_MOMO',
   moov_money: 'MOOV_MONEY',
   card: 'CARTE_BANCAIRE',
   paystack: 'CARTE_BANCAIRE',
   pawapay: 'WAVE',
+  mobile_money: 'WAVE',
 };
 
 export function sourceForMethod(method) {
@@ -283,7 +285,7 @@ export async function declarePayment(user, body) {
       ]
     );
   } catch (error) {
-    await pool.query(`UPDATE transactions SET statut = 'ANNULE', updated_at = NOW() WHERE id = $1`, [
+    await pool.query(`UPDATE transactions SET statut = 'ECHEC', updated_at = NOW() WHERE id = $1`, [
       pending.transaction.id,
     ]);
     throw error;
@@ -503,19 +505,23 @@ export async function withdraw(actor, body) {
 }
 
 const STATUS_MAP = {
+  pending: null,
+  processing: null,
   completed: 'VALIDE',
   success: 'VALIDE',
-  failed: 'REJETE',
+  failed: 'ECHEC',
   cancelled: 'ANNULE',
   canceled: 'ANNULE',
-  expired: 'ANNULE',
+  expired: 'ECHEC',
+  declined: 'ECHEC',
+  rejected: 'ECHEC',
   refunded: 'ANNULE',
 };
 
 export async function applyGatewayUpdate(data) {
   const meta = data.metadata || {};
   const reference = data.reference;
-  const localId = meta.transaction_id || meta.order_id;
+  const localId = meta.transaction_id || meta.order_id || meta.transactionId;
   const { rows } = await pool.query(
     `SELECT * FROM transactions
      WHERE ($1::uuid IS NOT NULL AND id = $1::uuid)
@@ -527,7 +533,10 @@ export async function applyGatewayUpdate(data) {
   if (!tx) return null;
   const remoteStatus = String(data.status || '').toLowerCase();
   const statut = STATUS_MAP[remoteStatus];
-  const method = GATEWAY_TO_LOCAL[String(data.payment_method || data.provider || '').toLowerCase()];
+  const methodKey = String(
+    data.payment_method || data.payment_provider || data.provider || ''
+  ).toLowerCase();
+  const method = GATEWAY_TO_LOCAL[methodKey];
   await pool.query(
     `UPDATE transactions
      SET frais = COALESCE($2, frais),
@@ -557,8 +566,26 @@ export async function syncPayment(user, id) {
   const staff = user.role === 'SUPER_ADMIN' || user.role === 'TRESORIER' || user.role === 'ADMINISTRATEUR';
   if (!owner && !staff) throw new AppError(403, 'Accès refusé.');
   if (!tx.geniuspay_reference) return presentTransaction(tx);
-  const remote = await getGeniusPayment(tx.geniuspay_reference);
-  await applyGatewayUpdate(remote);
+  let remote = null;
+  try {
+    remote = await getGeniusPayment(tx.geniuspay_reference);
+    await applyGatewayUpdate(remote);
+  } catch {
+    // En cas d'erreur de contact passerelle
+  }
+  const updated = await loadPaymentView(tx.id);
+  if (!updated) return presentTransaction(tx);
+  if (updated.statut === 'VALIDE') return presentTransaction(updated);
+
+  const remoteStatus = String(remote?.status || '').toLowerCase();
+  const mapped = STATUS_MAP[remoteStatus];
+  if (mapped && mapped !== updated.statut && updated.statut !== 'VALIDE') {
+    try {
+      await setPaymentStatus(null, tx.id, mapped);
+    } catch (error) {
+      if (error.status !== 409) throw error;
+    }
+  }
   return presentTransaction(await loadPaymentView(tx.id));
 }
 

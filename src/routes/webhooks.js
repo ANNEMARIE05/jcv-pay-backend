@@ -33,6 +33,9 @@ router.post(
       'payment.expired': 'expired',
       'payment.refunded': 'refunded',
     };
+    if (event === 'webhook.test') return res.json({ received: true, test: true });
+    if (event === 'payment.initiated') return res.json({ received: true });
+
     if (data && !data.status && statusFromEvent[event]) data.status = statusFromEvent[event];
     if (data?.reference || data?.metadata) await applyGatewayUpdate(data);
     res.json({ received: true });
