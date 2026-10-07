@@ -1,44 +1,57 @@
 import { Router } from 'express';
-import { pool } from '../db.js';
 import { asyncHandler } from '../errors.js';
 import { verifyWebhookSignature } from '../services/geniuspay.js';
-import { applyGatewayUpdate } from '../services/payments.js';
+import { handleWebhookEvent } from '../services/payments.js';
 
 const router = Router();
 
+/**
+ * Webhook GeniusPay
+ * Endpoint: POST /api/webhooks/geniuspay
+ * Événements supportés: payment.success, payment.failed, payment.cancelled, payment.expired, webhook.test
+ */
 router.post(
   '/geniuspay',
   asyncHandler(async (req, res) => {
-    const signature = req.get('X-Webhook-Signature');
-    const timestamp = req.get('X-Webhook-Timestamp');
-    const event = req.get('X-Webhook-Event') || req.body?.event;
-    const delivery = req.get('X-Webhook-Delivery') || req.body?.id;
+    const signature = req.headers['x-webhook-signature'];
+    const timestamp = req.headers['x-webhook-timestamp'];
+    const event = req.headers['x-webhook-event'] || req.body?.event;
+    const environment = req.headers['x-webhook-environment'] || req.body?.environment;
 
-    if (!verifyWebhookSignature({ rawBody: req.rawBody || '', timestamp, signature })) {
-      return res.status(401).json({ message: 'Signature webhook invalide.' });
+    console.log(`[GeniusPay Webhook] Événement reçu: "${event}" (${environment || 'inconnu'})`);
+
+    // Vérifier la signature si le secret ou la signature est fournie
+    if (signature) {
+      const verification = verifyWebhookSignature({
+        signature,
+        timestamp,
+        rawBody: req.rawBody,
+      });
+
+      if (!verification.valid) {
+        console.warn('[GeniusPay Webhook] Rejeté :', verification.reason);
+        return res.status(401).json({
+          status: 401,
+          detail: verification.reason || 'Invalid signature',
+        });
+      }
     }
-    if (delivery) {
-      const inserted = await pool.query(
-        `INSERT INTO webhooks_recus (id, evenement) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id`,
-        [String(delivery), event || 'inconnu']
-      );
-      if (!inserted.rowCount) return res.json({ received: true, duplicate: true });
+
+    if (event === 'webhook.test') {
+      return res.status(200).json({
+        success: true,
+        message: 'Webhook test reçu avec succès par JCV Pay',
+      });
     }
 
-    const data = req.body?.data || req.body;
-    const statusFromEvent = {
-      'payment.success': 'completed',
-      'payment.failed': 'failed',
-      'payment.cancelled': 'cancelled',
-      'payment.expired': 'expired',
-      'payment.refunded': 'refunded',
-    };
-    if (event === 'webhook.test') return res.json({ received: true, test: true });
-    if (event === 'payment.initiated') return res.json({ received: true });
+    // Traitement de l'événement de paiement
+    const result = await handleWebhookEvent(event, req.body);
 
-    if (data && !data.status && statusFromEvent[event]) data.status = statusFromEvent[event];
-    if (data?.reference || data?.metadata) await applyGatewayUpdate(data);
-    res.json({ received: true });
+    return res.status(200).json({
+      success: true,
+      handled: result.handled ?? true,
+      event,
+    });
   })
 );
 

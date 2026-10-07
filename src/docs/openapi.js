@@ -33,7 +33,7 @@ export const openApiDocument = {
       '',
       '**Rôles**',
       '- `MEMBRE` et `RESPONSABLE` : espace personnel, profil et versements.',
-      '- `TRESORIER` : campagnes, caisse, validation des versements et solde GeniusPay.',
+      '- `TRESORIER` : campagnes, caisse et validation des versements.',
       '- `ADMINISTRATEUR` : campagnes et gestion des comptes.',
       '- `SUPER_ADMIN` : l’ensemble des actions.',
     ].join('\n'),
@@ -66,7 +66,7 @@ export const openApiDocument = {
     '/paiement/retour': {
       get: {
         tags: ['Paiements'],
-        summary: 'Page de retour après le checkout GeniusPay',
+        summary: 'Page de confirmation de versement',
         parameters: [
           {
             name: 'status',
@@ -318,7 +318,7 @@ export const openApiDocument = {
         tags: ['Paiements'],
         summary: 'Déclarer un versement',
         description:
-          'Wave, Orange Money, MTN, Moov et carte ouvrent un checkout GeniusPay (montant minimum 200 FCFA) et renvoient `checkoutUrl`. Les espèces et virements restent en attente de validation par la trésorerie. Un versement de type `PROJET` doit indiquer `projetId` ou `caisseProjetId`.',
+          'Déclaration de versement (Wave, Orange Money, MTN MoMo, Moov Money, Carte, Espèces, Virement). Le versement est enregistré en attente de validation par la trésorerie. Un versement de type `PROJET` doit indiquer `projetId` ou `caisseProjetId`.',
         security: bearer,
         requestBody: json('Versement.', { $ref: '#/components/schemas/NouveauPaiement' }),
         responses: {
@@ -333,8 +333,8 @@ export const openApiDocument = {
     '/api/paiements/{id}/synchroniser': {
       post: {
         tags: ['Paiements'],
-        summary: 'Relire le statut GeniusPay d’un versement',
-        description: 'Le donateur, un administrateur ou le trésorier peuvent synchroniser. `id` accepte l’identifiant, la référence, la référence GeniusPay ou le numéro de reçu.',
+        summary: 'Relire le statut d’un versement',
+        description: 'Le donateur, un administrateur ou le trésorier peuvent synchroniser. `id` accepte l’identifiant, la référence ou le numéro de reçu.',
         security: bearer,
         parameters: [{ $ref: '#/components/parameters/ReferencePaiement' }],
         responses: {
@@ -434,19 +434,6 @@ export const openApiDocument = {
         },
       },
     },
-    '/api/tresorerie/geniuspay': {
-      get: {
-        tags: ['Trésorerie'],
-        summary: 'Lire le solde du compte marchand GeniusPay',
-        description: 'Réservé à `SUPER_ADMIN` et `TRESORIER`.',
-        security: bearer,
-        responses: {
-          200: json('Solde renvoyé par GeniusPay.', { type: 'object', additionalProperties: true }),
-          401: nonAutorise,
-          403: interdit,
-        },
-      },
-    },
     '/api/utilisateurs': {
       get: {
         tags: ['Utilisateurs'],
@@ -541,32 +528,6 @@ export const openApiDocument = {
         },
       },
     },
-    '/api/webhooks/geniuspay': {
-      post: {
-        tags: ['Webhooks'],
-        summary: 'Recevoir un événement GeniusPay',
-        description:
-          'Signature HMAC-SHA256 du corps brut, préfixée par l’horodatage : `timestamp.rawBody`. L’en-tête `X-Webhook-Delivery` sert à ignorer les doublons.',
-        parameters: [
-          { name: 'X-Webhook-Signature', in: 'header', required: true, schema: { type: 'string' } },
-          { name: 'X-Webhook-Timestamp', in: 'header', required: true, schema: { type: 'string' } },
-          { name: 'X-Webhook-Event', in: 'header', schema: { type: 'string', example: 'payment.success' } },
-          { name: 'X-Webhook-Delivery', in: 'header', schema: { type: 'string' } },
-        ],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: { type: 'object', additionalProperties: true },
-            },
-          },
-        },
-        responses: {
-          200: json('Événement accepté.', { $ref: '#/components/schemas/WebhookRecu' }),
-          401: erreur('Signature webhook invalide.'),
-        },
-      },
-    },
   },
   components: {
     securitySchemes: {
@@ -587,7 +548,7 @@ export const openApiDocument = {
         name: 'id',
         in: 'path',
         required: true,
-        description: 'Identifiant, référence interne, référence GeniusPay ou numéro de reçu.',
+        description: 'Identifiant, référence interne ou numéro de reçu.',
         schema: { type: 'string' },
       },
     },
@@ -674,7 +635,6 @@ export const openApiDocument = {
           donateurNom: { type: 'string' },
           donateurTelephone: { type: 'string' },
           checkoutUrl: { type: 'string' },
-          geniuspayReference: { type: 'string' },
         },
       },
       Recu: {

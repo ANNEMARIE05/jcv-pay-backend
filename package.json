@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "API JCV Pay — Node.js, PostgreSQL et GeniusPay",
+  "description": "API JCV Pay — Node.js et PostgreSQL",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

@@ -13,7 +13,7 @@ import {
 } from './present.js';
 
 const TX_SELECT = `
-  SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id
+  SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id
   FROM transactions t
   LEFT JOIN recus r ON r.transaction_id = t.id
 `;

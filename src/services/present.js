@@ -37,31 +37,33 @@ export function presentTransaction(row) {
     donateurNom: row.donateur_nom,
     donateurTelephone: row.donateur_telephone,
     checkoutUrl: row.checkout_url || undefined,
-    geniuspayReference: row.geniuspay_reference || undefined,
+    passerelleConfirmee: false,
   };
 }
 
 export function presentReceipt(row) {
+  const txId = row.transaction_id || (row.recu_id ? row.id : (row.transaction_id || row.id));
+  const recuId = row.recu_id || row.id;
   return {
-    id: row.recu_id || row.id,
-    numeroRecu: row.numero_recu,
-    transactionId: row.transaction_id,
-    titre: row.titre,
-    type: row.type,
-    donateurNom: row.donateur_nom,
+    id: recuId,
+    numeroRecu: row.numero_recu || '',
+    transactionId: txId || '',
+    titre: row.titre || '',
+    type: row.type || 'LIBRE',
+    donateurNom: row.donateur_nom || '',
     donateurMatricule: row.donateur_matricule || '',
-    donateurTelephone: row.donateur_telephone,
+    donateurTelephone: row.donateur_telephone || '',
     donateurEmail: row.donateur_email || '',
-    montant: Number(row.montant),
+    montant: Number(row.montant || 0),
     frais: Number(row.frais || 0),
-    total: Number(row.montant),
+    total: Number(row.montant || 0),
     date: formatDateFr(row.created_at),
     heure: formatHeure(row.created_at),
-    statut: row.statut,
-    moyenPaiement: row.moyen_paiement,
+    statut: row.statut || 'EN_ATTENTE',
+    moyenPaiement: row.moyen_paiement || 'ESPECES',
     egliseNom: config.org.nom,
     egliseAdresse: config.org.adresse,
-    codeSecurite: row.code_securite,
+    codeSecurite: row.code_securite || '',
   };
 }
 

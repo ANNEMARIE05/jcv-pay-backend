@@ -1,6 +1,6 @@
 # JCV Pay — API
 
-Backend Node.js et PostgreSQL de l’application JCV Pay (Église Jésus Christ Victoire). Les clés GeniusPay restent sur ce serveur.
+Backend Node.js et PostgreSQL de l’application JCV Pay (Église Jésus Christ Victoire).
 
 ## Démarrage
 
@@ -10,7 +10,7 @@ Backend Node.js et PostgreSQL de l’application JCV Pay (Église Jésus Christ 
 docker compose up -d
 ```
 
-2. Copier `.env.example` vers `.env` et renseigner les clés GeniusPay.
+2. Copier `.env.example` vers `.env` et ajuster les variables.
 
 3. Installer et démarrer :
 
@@ -35,30 +35,7 @@ Au lancement, une caisse principale est créée si elle n’existe pas. Elle ne 
 - `POST /api/caisses/:id/supprimer` — retire une caisse vide.
 - `POST /api/fideles` — crée un fidèle (rôle membre) et renvoie un mot de passe temporaire.
 
-## Paiements GeniusPay
+## Paiements & Déclarations
 
-Wave, Orange Money, MTN, Moov et carte passent par [l’API marchand GeniusPay](https://geniuspay.ci/docs/api). Le serveur crée le paiement, renvoie `checkout_url`, puis confirme le versement au webhook `POST /api/webhooks/geniuspay` (signature HMAC-SHA256). Les espèces et virements restent des déclarations validées par la trésorerie.
+Les versements sont enregistrés directement dans l'application (Wave, Orange Money, MTN MoMo, Moov Money, Carte, Espèces, Virement). Chaque déclaration génère immédiatement un reçu officiel avec code de sécurité, et le versement est validé par la trésorerie.
 
-Dans `.env` ([doc API](https://geniuspay.ci/docs/api)) :
-
-| Variable | Header HTTP | Préfixe |
-| --- | --- | --- |
-| `GENIUSPAY_PUBLIC_KEY` | `X-API-Key` | `pk_sandbox_…` / `pk_live_…` |
-| `GENIUSPAY_SECRET_KEY` | `X-API-Secret` | `sk_sandbox_…` / `sk_live_…` |
-| `GENIUSPAY_WEBHOOK_SECRET` | signature webhook | `whsec_…` |
-
-Par défaut `GENIUSPAY_USE_CHECKOUT=1` : création de paiement **sans** `payment_method` → `checkout_url` hébergée.
-
-Vérifier la connexion (copiez les clés avec le bouton du dashboard, sans espace) :
-
-```bash
-node scripts/check-geniuspay.mjs
-```
-
-Si toutes les lignes affichent **401**, les clés Sandbox ne sont pas reconnues par l’API : régénérez-les dans Intégrations ou contactez le support GeniusPay. Le webhook auto n’est enregistré qu’avec une `PUBLIC_BASE_URL` en **HTTPS** (en local HTTP, utilisez la sync `/api/paiements/:id/synchroniser`).
-
-Au démarrage, le serveur tente d’enregistrer le webhook vers `{PUBLIC_BASE_URL}/api/webhooks/geniuspay` si absent. Copiez le `whsec_…` affiché dans `GENIUSPAY_WEBHOOK_SECRET` (en dev, sans secret, les webhooks sont acceptés hors production).
-
-URL de webhook à enregistrer chez GeniusPay : `https://<votre-domaine>/api/webhooks/geniuspay`
-
-Événements : `payment.success`, `payment.failed`, `payment.cancelled`, `payment.expired`.

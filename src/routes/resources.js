@@ -5,7 +5,6 @@ import { requireAuth, requireCampaigns, requireMoney, requirePeople } from '../m
 import { buildEspace, notify } from '../services/espace.js';
 import { presentMouvement, presentUser } from '../services/present.js';
 import { deleteCaisse, nextMatricule, recordCash, setPaymentStatus, transferCaisse, withdraw } from '../services/payments.js';
-import { getGeniusBalance } from '../services/geniuspay.js';
 import { auditLog } from '../services/audit.js';
 import { hashPassword } from '../utils/auth.js';
 import { cleanEmail, formatPhone, normalizePhone } from '../utils/phone.js';
@@ -209,17 +208,8 @@ router.post(
   '/paiements/:id/rejeter',
   requireAuth,
   requireMoney,
-  asyncHandler(async (req, res) => {
-    await setPaymentStatus(req.user, req.params.id, 'REJETE');
-    await auditLog({
-      acteurId: req.user.id,
-      acteurRole: req.user.role,
-      action: 'PAIEMENT_REJETE',
-      cibleType: 'transaction',
-      cibleId: req.params.id,
-      ip: req.ip,
-    });
-    res.json(await buildEspace(req.user));
+  asyncHandler(async (_req, _res) => {
+    throw new AppError(403, 'Le rejet manuel des versements n’est pas autorisé. Confirmez uniquement la réception effective.');
   })
 );
 
@@ -231,15 +221,6 @@ router.post(
     const row = await withdraw(req.user, req.body);
     if (!row) throw new AppError(400, 'Solde insuffisant sur cette caisse.');
     res.status(201).json({ mouvement: presentMouvement(row), espace: await buildEspace(req.user) });
-  })
-);
-
-router.get(
-  '/tresorerie/geniuspay',
-  requireAuth,
-  requireMoney,
-  asyncHandler(async (req, res) => {
-    res.json(await getGeniusBalance());
   })
 );
 

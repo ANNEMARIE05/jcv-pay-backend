@@ -9,7 +9,6 @@ import webhookRoutes from './routes/webhooks.js';
 import { openApiDocument } from './docs/openapi.js';
 import { AppError } from './errors.js';
 import { config, isProd } from './config.js';
-import { loadPaymentView, setPaymentStatus } from './services/payments.js';
 import {
   apiLimiter,
   authLimiter,
@@ -20,6 +19,7 @@ import {
   bodySizeGuard,
 } from './middleware/security.js';
 import { ipBlockMiddleware } from './services/audit.js';
+import { syncPaymentByReference } from './services/payments.js';
 
 export function createApp() {
   const app = express();
@@ -35,7 +35,7 @@ export function createApp() {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'"],   // pour la page retour
         styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", 'data:'],
+        imgSrc: ["'self'", 'data:', 'https:'],
         connectSrc: ["'self'"],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],
@@ -101,80 +101,312 @@ export function createApp() {
     })
   );
 
-  app.get('/paiement/retour', (req, res) => {
-    const ok = req.query.status === 'success';
-    res.type('html').send(`<!doctype html>
-      <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>JCV Pay</title></head>
-      <body style="font-family:sans-serif;padding:32px;text-align:center;">
-        <h1 style="color:${ok ? '#15803d' : '#b91c1c'};margin-bottom:12px;">${ok ? '✓ Paiement confirmé' : '✕ Paiement non abouti'}</h1>
-        <p style="color:#475569;font-size:15px;line-height:1.5;">Vous pouvez fermer cette page et revenir dans l’application JCV Pay.<br>Le reçu se met à jour immédiatement.</p>
-      </body></html>`);
-  });
+  app.get('/paiement/retour', async (req, res) => {
+    const rawStatus = String(req.query.status || '').toLowerCase();
+    const isSuccess = rawStatus === 'success';
+    const ref = String(req.query.ref || '').trim();
 
-  app.get('/paiement/simulation', async (req, res) => {
-    const txId = req.query.tx;
-    if (!txId) return res.status(400).send('Transaction ID manquant.');
-    const row = await loadPaymentView(txId);
-    if (!row) return res.status(404).send('Transaction introuvable.');
-    if (row.statut === 'VALIDE') {
-      return res.redirect(`${config.publicBaseUrl}/paiement/retour?status=success`);
+    let view = null;
+    if (ref) {
+      try {
+        view = await syncPaymentByReference(ref, rawStatus);
+      } catch (err) {
+        console.warn('[Paiement Retour Sync Warning]', err.message);
+      }
     }
-    const formattedAmount = Number(row.montant).toLocaleString('fr-FR');
+
+    const isValide = view?.statut === 'VALIDE';
+    const isPendingTreasury =
+      view?.statut === 'EN_ATTENTE' &&
+      view?.montant_net != null &&
+      Boolean(view?.geniuspay_id || view?.geniuspay_reference);
+    const isGatewayOk = isValide || isPendingTreasury || (isSuccess && Boolean(view?.recu_id));
+    const recuId = view?.recu_id || '';
+    const montantNum = view?.montant ? Number(view.montant) : null;
+    const montantStr = montantNum ? `${montantNum.toLocaleString('fr-FR')} FCFA` : '';
+    const titreStr = view?.titre || 'Contribution Financière';
+    const numeroRecu = view?.numero_recu || '';
+
+    // URL de redirection vers l'application mobile (deep link Expo scheme: jcvpay)
+    const deepLink = isGatewayOk
+      ? (recuId ? `jcvpay://recu/${recuId}?choix=1` : 'jcvpay://recus')
+      : `jcvpay://paiement?error=1&ref=${encodeURIComponent(ref)}`;
+
+    // URL de secours Web
+    const webUrl = isGatewayOk
+      ? (recuId ? `${config.clientUrl}/recu/${recuId}?choix=1` : `${config.clientUrl}/recus`)
+      : `${config.clientUrl}/paiement?error=1&ref=${encodeURIComponent(ref)}`;
+
+    const pageTitle = isValide
+      ? 'Paiement confirmé'
+      : isPendingTreasury
+        ? 'Paiement en attente de confirmation'
+        : 'Paiement non abouti';
+    const heading = isValide
+      ? 'Paiement confirmé !'
+      : isPendingTreasury
+        ? 'Paiement enregistré'
+        : 'Paiement non abouti';
+    const description = isValide
+      ? 'Votre contribution a été validée avec succès. Votre reçu officiel a été généré et certifié.'
+      : isPendingTreasury
+        ? 'Votre paiement en ligne a bien été reçu. La trésorerie du Temple confirmera la réception avant la certification du reçu officiel.'
+        : 'La transaction n’a pas pu être validée ou a été annulée. Vous pouvez réessayer votre paiement.';
+    const iconChar = isValide ? '✓' : isPendingTreasury ? '⏳' : '✕';
+    const toneOk = isValide;
+    const tonePending = isPendingTreasury;
+    const statusBadge = isValide
+      ? '<span class="badge-ok">Validé</span>'
+      : isPendingTreasury
+        ? '<span class="badge-warn">En attente trésorerie</span>'
+        : '<span class="badge-err">Non validé</span>';
+    const primaryBtn = isValide
+      ? 'Ouvrir mon reçu dans l’application'
+      : isPendingTreasury
+        ? 'Suivre mon versement dans l’application'
+        : 'Réessayer dans l’application';
+    const secondaryBtn = isValide
+      ? 'Consulter le reçu sur le Web'
+      : isPendingTreasury
+        ? 'Voir le statut sur le Web'
+        : 'Retourner au formulaire';
+    const iconBg = toneOk
+      ? 'rgba(16, 185, 129, 0.15)'
+      : tonePending
+        ? 'rgba(245, 158, 11, 0.15)'
+        : 'rgba(239, 68, 68, 0.15)';
+    const iconColor = toneOk ? '#10B981' : tonePending ? '#F59E0B' : '#EF4444';
+    const iconBorder = iconColor;
+    const iconShadow = toneOk
+      ? 'rgba(16, 185, 129, 0.25)'
+      : tonePending
+        ? 'rgba(245, 158, 11, 0.25)'
+        : 'rgba(239, 68, 68, 0.25)';
+    const headingColor = toneOk ? '#34D399' : tonePending ? '#FBBF24' : '#F87171';
+    const btnPrimaryBg = toneOk ? '#0D9488' : tonePending ? '#D97706' : '#DC2626';
+    const btnPrimaryShadow = toneOk
+      ? 'rgba(13, 148, 136, 0.35)'
+      : tonePending
+        ? 'rgba(217, 119, 6, 0.35)'
+        : 'rgba(220, 38, 38, 0.35)';
+
     res.type('html').send(`<!doctype html>
       <html lang="fr">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Simulateur GeniusPay — JCV Pay</title>
+        <title>JCV Pay — ${pageTitle}</title>
+        <script>
+          // Tentative d'ouverture immédiate de l'application JCV Pay
+          const deepLink = ${JSON.stringify(deepLink)};
+          const webUrl = ${JSON.stringify(webUrl)};
+          try {
+            window.location.href = deepLink;
+          } catch (e) {
+            console.warn(e);
+          }
+        </script>
         <style>
           * { box-sizing: border-box; margin: 0; padding: 0; }
-          body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f1f5f9; color: #1e293b; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
-          .card { background: white; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); max-width: 440px; width: 100%; padding: 28px; }
-          .tag { display: inline-block; background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase; margin-bottom: 12px; }
-          h1 { font-size: 20px; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
-          .sub { font-size: 13px; color: #64748b; margin-bottom: 20px; }
-          .amount-box { background: #f0fdf4; border: 1.5px dashed #86efac; border-radius: 14px; padding: 18px; text-align: center; margin-bottom: 20px; }
-          .amount { font-size: 32px; font-weight: 800; color: #15803d; }
-          .details { background: #f8fafc; border-radius: 12px; padding: 14px; font-size: 13px; color: #475569; margin-bottom: 24px; line-height: 1.8; }
-          .details strong { color: #0f172a; }
-          .btn-pay { display: block; width: 100%; background: #004d40; color: white; border: none; padding: 15px; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; transition: background 0.2s; }
-          .btn-pay:hover { background: #00382e; }
-          .btn-cancel { display: block; text-align: center; margin-top: 10px; color: #94a3b8; text-decoration: none; font-size: 13px; padding: 8px; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0B1120;
+            color: #F8FAFC;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 24px;
+          }
+          .card {
+            background: #151E32;
+            border: 1px solid #1E293B;
+            border-radius: 28px;
+            max-width: 460px;
+            width: 100%;
+            padding: 38px 28px;
+            text-align: center;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+          }
+          .brand {
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #D97706;
+            margin-bottom: 20px;
+          }
+          .icon-box {
+            width: 80px;
+            height: 80px;
+            border-radius: 40px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 38px;
+            font-weight: 700;
+            margin-bottom: 20px;
+            background: ${iconBg};
+            color: ${iconColor};
+            border: 2px solid ${iconBorder};
+            box-shadow: 0 0 25px ${iconShadow};
+          }
+          h1 {
+            font-size: 23px;
+            font-weight: 800;
+            margin-bottom: 10px;
+            color: ${headingColor};
+          }
+          .desc {
+            color: #94A3B8;
+            font-size: 14px;
+            line-height: 1.6;
+            margin-bottom: 24px;
+          }
+          .info-table {
+            background: #0F172A;
+            border: 1px solid #1E293B;
+            border-radius: 18px;
+            padding: 16px 18px;
+            margin-bottom: 24px;
+            text-align: left;
+          }
+          .info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #1E293B;
+            font-size: 13px;
+          }
+          .info-row:last-child { border-bottom: none; }
+          .info-label { color: #64748B; font-weight: 500; }
+          .info-value { color: #F1F5F9; font-weight: 700; text-align: right; }
+          .info-value.amount { color: #34D399; font-size: 15px; }
+          .badge-ok {
+            display: inline-block;
+            background: rgba(16, 185, 129, 0.15);
+            color: #34D399;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 12px;
+          }
+          .badge-err {
+            display: inline-block;
+            background: rgba(239, 68, 68, 0.15);
+            color: #F87171;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 12px;
+          }
+          .badge-warn {
+            display: inline-block;
+            background: rgba(245, 158, 11, 0.15);
+            color: #FBBF24;
+            padding: 4px 10px;
+            border-radius: 8px;
+            font-weight: 700;
+            font-size: 12px;
+          }
+          .actions {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+          }
+          .btn-primary {
+            display: block;
+            width: 100%;
+            background: ${btnPrimaryBg};
+            color: white;
+            text-decoration: none;
+            padding: 15px 20px;
+            border-radius: 14px;
+            font-weight: 700;
+            font-size: 15px;
+            transition: all 0.2s;
+            box-shadow: 0 4px 12px ${btnPrimaryShadow};
+          }
+          .btn-primary:hover {
+            opacity: 0.92;
+            transform: translateY(-1px);
+          }
+          .btn-secondary {
+            display: block;
+            width: 100%;
+            background: transparent;
+            color: #94A3B8;
+            text-decoration: none;
+            padding: 13px 20px;
+            border-radius: 14px;
+            font-weight: 600;
+            font-size: 14px;
+            border: 1px solid #334155;
+            transition: all 0.2s;
+          }
+          .btn-secondary:hover {
+            background: #1E293B;
+            color: #F8FAFC;
+          }
+          .subtext {
+            font-size: 12px;
+            color: #475569;
+            margin-top: 20px;
+          }
         </style>
       </head>
       <body>
         <div class="card">
-          <div class="tag">Simulateur GeniusPay Sandbox</div>
-          <h1>JCV Pay</h1>
-          <p class="sub">${row.titre || 'Paiement de versement'}</p>
-          <div class="amount-box">
-            <div class="amount">${formattedAmount} FCFA</div>
+          <div class="brand">JCV Pay • Église Jésus Christ Victoire</div>
+          <div class="icon-box">${iconChar}</div>
+          <h1>${heading}</h1>
+          <p class="desc">${description}</p>
+
+          <div class="info-table">
+            ${montantStr ? `
+            <div class="info-row">
+              <span class="info-label">Montant</span>
+              <span class="info-value amount">${montantStr}</span>
+            </div>` : ''}
+            <div class="info-row">
+              <span class="info-label">Versement</span>
+              <span class="info-value">${titreStr}</span>
+            </div>
+            ${numeroRecu ? `
+            <div class="info-row">
+              <span class="info-label">Reçu N°</span>
+              <span class="info-value">${numeroRecu}</span>
+            </div>` : ''}
+            ${ref ? `
+            <div class="info-row">
+              <span class="info-label">Référence</span>
+              <span class="info-value" style="font-family: monospace;">${ref}</span>
+            </div>` : ''}
+            <div class="info-row">
+              <span class="info-label">Statut</span>
+              <span>${statusBadge}</span>
+            </div>
           </div>
-          <div class="details">
-            <div><strong>Donateur :</strong> ${row.donateur_nom || 'Anonyme'}</div>
-            <div><strong>Téléphone :</strong> ${row.donateur_telephone || '—'}</div>
-            <div><strong>Mode sélectionné :</strong> ${row.moyen_paiement || 'MOBILE MONEY'}</div>
+
+          <div class="actions">
+            <a class="btn-primary" href="${deepLink}">
+              ${primaryBtn}
+            </a>
+            <a class="btn-secondary" href="${webUrl}">
+              ${secondaryBtn}
+            </a>
           </div>
-          <form method="POST" action="/paiement/simulation/valider">
-            <input type="hidden" name="transactionId" value="${row.id}" />
-            <button type="submit" class="btn-pay">Confirmer le paiement (Test)</button>
-          </form>
-          <a href="/paiement/retour?status=error" class="btn-cancel">Annuler la transaction</a>
+
+          <div class="subtext">
+            Si l’application ne s’ouvre pas automatiquement, appuyez sur le bouton ci-dessus.
+          </div>
         </div>
       </body>
       </html>`);
   });
 
-  app.post('/paiement/simulation/valider', express.urlencoded({ extended: true }), async (req, res) => {
-    const txId = req.body.transactionId;
-    if (!txId) return res.status(400).send('Transaction ID manquant.');
-    try {
-      await setPaymentStatus(null, txId, 'VALIDE');
-      res.redirect(`${config.publicBaseUrl}/paiement/retour?status=success`);
-    } catch (e) {
-      res.status(500).send('Erreur validation : ' + e.message);
-    }
-  });
+
 
   // ── Routes applicatives ───────────────────────────────────────────────
   app.use('/api/auth', authLimiter, authRoutes);

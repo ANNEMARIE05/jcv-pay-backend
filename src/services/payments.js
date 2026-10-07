@@ -11,19 +11,11 @@ import {
 } from '../utils/codes.js';
 import { presentReceipt, presentTransaction } from './present.js';
 import { notify, sourceBalance } from './espace.js';
-import { createGeniusPayment, getGeniusPayment, isGatewayMethod } from './geniuspay.js';
-
-const GATEWAY_TO_LOCAL = {
-  wave: 'WAVE',
-  orange_money: 'ORANGE_MONEY',
-  mtn_money: 'MTN_MOMO',
-  mtn_momo: 'MTN_MOMO',
-  moov_money: 'MOOV_MONEY',
-  card: 'CARTE_BANCAIRE',
-  paystack: 'CARTE_BANCAIRE',
-  pawapay: 'WAVE',
-  mobile_money: 'WAVE',
-};
+import {
+  createPayment,
+  getPayment,
+  hasGeniusPayCredentials,
+} from './geniuspay.js';
 
 export function sourceForMethod(method) {
   if (method === 'WAVE') return 'WAVE';
@@ -48,81 +40,120 @@ const PAYMENT_METHODS = new Set([
   'MTN_MOMO',
   'MOOV_MONEY',
   'CARTE_BANCAIRE',
-  'VIREMENT',
   'ESPECES',
 ]);
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value) {
+  return UUID_RE.test(String(value || ''));
+}
+
 function optionalUuid(value, label) {
-  if (value == null || String(value).trim() === '') return null;
+  if (value == null) return null;
   const id = String(value).trim();
+  if (!id) return null;
   if (id === 'principale') return 'principale';
   if (!isUuid(id)) throw new AppError(400, `${label} invalide.`);
   return id;
 }
 
+function validateContributionTargets(type, projet, caisse, evenement, cotisation) {
+  if (!CONTRIBUTION_TYPES.has(type)) {
+    throw new AppError(400, 'Type de versement invalide.');
+  }
+  if (evenement === 'principale' || cotisation === 'principale') {
+    throw new AppError(400, 'Référence invalide.');
+  }
+  const isCaissePrincipaleOrEmpty = !caisse || caisse === 'principale';
+  if (type === 'PROJET' && !projet && isCaissePrincipaleOrEmpty) {
+    throw new AppError(400, 'Sélectionnez le projet concerné par ce versement.');
+  }
+}
+
+async function resolveExplicitCaisse(caisseId, projetId) {
+  if (!caisseId || caisseId === 'principale') {
+    return { caisse: caisseId, projet: projetId };
+  }
+
+  const { rows } = await pool.query(
+    'SELECT * FROM caisses WHERE id = $1 AND supprimee = FALSE',
+    [caisseId]
+  );
+  const caisse = rows[0];
+  if (!caisse) {
+    throw new AppError(404, 'Caisse introuvable.');
+  }
+  if (caisse.principale) {
+    return { caisse: 'principale', projet: projetId };
+  }
+  if (caisse.statut === 'TERMINEE') {
+    throw new AppError(409, 'Cette caisse est clôturée.');
+  }
+  if (projetId && caisse.projet_id && caisse.projet_id !== projetId) {
+    throw new AppError(400, 'Cette caisse n’appartient pas à ce projet.');
+  }
+
+  const resolvedProjet = (!projetId && caisse.projet_id) ? caisse.projet_id : projetId;
+  return { caisse: caisse.id, projet: resolvedProjet };
+}
+
+async function resolveProjetCaisse(projetId, currentCaisseId) {
+  if (!projetId) return currentCaisseId;
+
+  const { rows } = await pool.query('SELECT * FROM projets WHERE id = $1', [projetId]);
+  const projet = rows[0];
+  if (!projet) {
+    throw new AppError(404, 'Projet introuvable.');
+  }
+  if (projet.statut === 'CLOTURE') {
+    throw new AppError(409, 'Ce projet est clôturé.');
+  }
+
+  if (currentCaisseId && currentCaisseId !== 'principale') {
+    return currentCaisseId;
+  }
+
+  const linked = await pool.query(
+    `SELECT id FROM caisses
+     WHERE projet_id = $1 AND supprimee = FALSE AND principale = FALSE AND statut = 'OUVERTE'
+     ORDER BY date_ouverture DESC
+     LIMIT 1`,
+    [projetId]
+  );
+  if (!linked.rows[0]) {
+    throw new AppError(400, 'Aucune caisse ouverte pour ce projet.');
+  }
+  return linked.rows[0].id;
+}
+
+async function assertEntityExists(table, id, label) {
+  if (!id) return;
+  const { rowCount } = await pool.query(`SELECT 1 FROM ${table} WHERE id = $1`, [id]);
+  if (!rowCount) {
+    throw new AppError(404, `${label} introuvable.`);
+  }
+}
+
 async function resolveTargets({ type, projetId, caisseId, evenementId, cotisationId }) {
-  if (!CONTRIBUTION_TYPES.has(type)) throw new AppError(400, 'Type de versement invalide.');
   let projet = optionalUuid(projetId, 'Projet');
   let caisse = optionalUuid(caisseId, 'Caisse');
   const evenement = optionalUuid(evenementId, 'Événement');
   const cotisation = optionalUuid(cotisationId, 'Cotisation');
   if (projet === 'principale') projet = null;
-  if (evenement === 'principale' || cotisation === 'principale') {
-    throw new AppError(400, 'Référence invalide.');
-  }
 
-  if (type === 'PROJET' && !projet && (!caisse || caisse === 'principale')) {
-    throw new AppError(400, 'Sélectionnez le projet concerné par ce versement.');
-  }
+  validateContributionTargets(type, projet, caisse, evenement, cotisation);
 
-  if (caisse && caisse !== 'principale') {
-    const { rows } = await pool.query(
-      `SELECT * FROM caisses WHERE id = $1 AND supprimee = FALSE`,
-      [caisse]
-    );
-    if (!rows[0]) throw new AppError(404, 'Caisse introuvable.');
-    if (rows[0].principale) {
-      caisse = 'principale';
-    } else if (rows[0].statut === 'TERMINEE') {
-      throw new AppError(409, 'Cette caisse est clôturée.');
-    } else if (projet && rows[0].projet_id && rows[0].projet_id !== projet) {
-      throw new AppError(400, 'Cette caisse n’appartient pas à ce projet.');
-    } else if (!projet && rows[0].projet_id) {
-      projet = rows[0].projet_id;
-    }
-  }
-
-  if (projet) {
-    const { rows } = await pool.query('SELECT * FROM projets WHERE id = $1', [projet]);
-    if (!rows[0]) throw new AppError(404, 'Projet introuvable.');
-    if (rows[0].statut === 'CLOTURE') throw new AppError(409, 'Ce projet est clôturé.');
-    if (!caisse || caisse === 'principale') {
-      const linked = await pool.query(
-        `SELECT id FROM caisses
-         WHERE projet_id = $1 AND supprimee = FALSE AND principale = FALSE AND statut = 'OUVERTE'
-         ORDER BY date_ouverture DESC
-         LIMIT 1`,
-        [projet]
-      );
-      if (!linked.rows[0]) throw new AppError(400, 'Aucune caisse ouverte pour ce projet.');
-      caisse = linked.rows[0].id;
-    }
-  }
+  const resolved = await resolveExplicitCaisse(caisse, projet);
+  projet = resolved.projet;
+  caisse = await resolveProjetCaisse(projet, resolved.caisse);
 
   if (!caisse || caisse === 'principale') {
-    const { rows } = await pool.query('SELECT id FROM caisses WHERE principale = TRUE LIMIT 1');
-    if (!rows[0]) throw new AppError(500, 'Caisse principale absente.');
-    caisse = rows[0].id;
+    caisse = await principalCaisseId(pool);
   }
 
-  if (evenement) {
-    const { rowCount } = await pool.query('SELECT 1 FROM evenements WHERE id = $1', [evenement]);
-    if (!rowCount) throw new AppError(404, 'Événement introuvable.');
-  }
-  if (cotisation) {
-    const { rowCount } = await pool.query('SELECT 1 FROM cotisations WHERE id = $1', [cotisation]);
-    if (!rowCount) throw new AppError(404, 'Cotisation introuvable.');
-  }
+  await assertEntityExists('evenements', evenement, 'Événement');
+  await assertEntityExists('cotisations', cotisation, 'Cotisation');
 
   return { projetId: projet, caisseId: caisse, evenementId: evenement, cotisationId: cotisation };
 }
@@ -160,12 +191,12 @@ async function insertPayment(client, input) {
        reference, titre, description, type, montant, statut, moyen_paiement,
        projet_id, evenement_id, cotisation_id, caisse_id,
        donateur_user_id, donateur_nom, donateur_telephone, donateur_telephone_norm,
-       donateur_email, donateur_matricule, frais, checkout_url, geniuspay_reference, geniuspay_id, environnement
+       donateur_email, donateur_matricule, frais, checkout_url, environnement
      ) VALUES (
        $1,$2,$3,$4,$5,$6,$7,
        $8,$9,$10,$11,
        $12,$13,$14,$15,
-       $16,$17,$18,$19,$20,$21,$22
+       $16,$17,$18,$19,$20
      ) RETURNING *`,
     [
       reference,
@@ -187,8 +218,6 @@ async function insertPayment(client, input) {
       input.donateurMatricule || null,
       input.frais || 0,
       input.checkoutUrl || null,
-      input.geniuspayReference || null,
-      input.geniuspayId || null,
       input.environnement || null,
     ]
   );
@@ -202,17 +231,17 @@ async function insertPayment(client, input) {
 
 export async function loadPaymentView(id) {
   const { rows } = await pool.query(
-    `SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id
+    `SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id
      FROM transactions t
      LEFT JOIN recus r ON r.transaction_id = t.id
-     WHERE t.id::text = $1 OR t.reference = $1 OR t.geniuspay_reference = $1 OR r.numero_recu = $1
+     WHERE t.id::text = $1 OR t.reference = $1 OR r.numero_recu = $1 OR t.geniuspay_reference = $1 OR r.id::text = $1
      LIMIT 1`,
     [id]
   );
   return rows[0] || null;
 }
 
-export async function declarePayment(user, body) {
+export async function declarePayment(user, body, options = {}) {
   const montant = money(body.montant);
   const moyen = body.moyenPaiement;
   if (!body.titre || !body.type || !moyen) throw new AppError(400, 'Titre, type et moyen de paiement sont requis.');
@@ -244,58 +273,82 @@ export async function declarePayment(user, body) {
     donateurMatricule: user.matricule,
   };
 
-  if (!isGatewayMethod(moyen)) {
-    const created = await withTx((client) =>
-      insertPayment(client, { ...base, statut: 'EN_ATTENTE' })
-    );
-    await notify(user.id, {
-      titre: 'Versement déclaré',
-      message: `${base.titre} est en attente de confirmation par la trésorerie.`,
-      type: 'PAIEMENT',
-      referenceId: created.transaction.id,
-    });
-    const view = await loadPaymentView(created.transaction.id);
-    return { transaction: presentTransaction(view), recu: presentReceipt(view), checkoutUrl: null };
+  const created = await withTx((client) =>
+    insertPayment(client, { ...base, statut: 'EN_ATTENTE' })
+  );
+
+  const isOnline = ['WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE'].includes(moyen);
+  let checkoutUrl = null;
+
+  if (isOnline && hasGeniusPayCredentials()) {
+    if (montant < 200) {
+      throw new AppError(400, 'Le montant minimum pour un paiement en ligne est de 200 FCFA.');
+    }
+
+    try {
+      const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
+      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}`;
+      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}`;
+
+      const gp = await createPayment({
+        amount: montant,
+        paymentMethod: moyen,
+        description: `${base.titre} — ${base.donateurNom}`,
+        customer: {
+          name: base.donateurNom,
+          email: base.donateurEmail,
+          phone: telephone,
+        },
+        metadata: {
+          transaction_id: created.transaction.id,
+          reference: created.transaction.reference,
+          order_id: created.transaction.reference,
+          donateur_user_id: user.id,
+          type: body.type,
+        },
+        successUrl,
+        errorUrl,
+      });
+
+      checkoutUrl = gp.checkout_url || gp.payment_url || null;
+
+      await pool.query(
+        `UPDATE transactions
+         SET geniuspay_id = $1,
+             geniuspay_reference = $2,
+             checkout_url = $3,
+             environnement = $4,
+             updated_at = NOW()
+         WHERE id = $5`,
+        [
+          gp.id ? String(gp.id) : null,
+          gp.reference || null,
+          checkoutUrl,
+          gp.environment || config.geniuspay.environment,
+          created.transaction.id,
+        ]
+      );
+    } catch (gpErr) {
+      console.error('[GeniusPay Initiation Error]', gpErr.message);
+      await pool.query(`UPDATE transactions SET statut = 'ECHEC' WHERE id = $1`, [created.transaction.id]);
+      throw gpErr;
+    }
   }
 
-  if (montant < 200) throw new AppError(400, 'Le montant minimum GeniusPay est de 200 FCFA.');
+  await notify(user.id, {
+    titre: isOnline ? 'Paiement initié' : 'Versement déclaré',
+    message: isOnline
+      ? `${base.titre} — Veuillez finaliser le paiement sur GeniusPay.`
+      : `${base.titre} est en attente de confirmation par la trésorerie.`,
+    type: 'PAIEMENT',
+    referenceId: created.transaction.id,
+  });
 
-  const pending = await withTx((client) => insertPayment(client, { ...base, statut: 'EN_ATTENTE' }));
-  try {
-    const remote = await createGeniusPayment({
-      amount: montant,
-      method: moyen,
-      description: base.titre,
-      customer: { name: base.donateurNom, email: base.donateurEmail, phone: telephone.replace(/\s/g, '') },
-      transactionId: pending.transaction.id,
-      userId: user.id,
-    });
-    await pool.query(
-      `UPDATE transactions
-       SET geniuspay_id = $2, geniuspay_reference = $3, checkout_url = $4, environnement = $5, frais = $6, montant_net = $7, updated_at = NOW()
-       WHERE id = $1`,
-      [
-        pending.transaction.id,
-        remote.id ? String(remote.id) : null,
-        remote.reference || null,
-        remote.checkout_url || remote.payment_url || null,
-        remote.environment || null,
-        money(remote.fees),
-        remote.net_amount != null ? money(remote.net_amount) : null,
-      ]
-    );
-  } catch (error) {
-    await pool.query(`UPDATE transactions SET statut = 'ECHEC', updated_at = NOW() WHERE id = $1`, [
-      pending.transaction.id,
-    ]);
-    throw error;
-  }
-
-  const view = await loadPaymentView(pending.transaction.id);
+  const view = await loadPaymentView(created.transaction.id);
   return {
     transaction: presentTransaction(view),
     recu: presentReceipt(view),
-    checkoutUrl: view.checkout_url,
+    checkoutUrl,
   };
 }
 
@@ -396,6 +449,10 @@ export async function setPaymentStatus(actor, id, statut) {
         auteur: actor ? `${actor.prenom} ${actor.nom}`.trim() : 'Trésorerie',
         auteurId: actor?.id,
       });
+      await client.query(
+        `UPDATE recus SET code_securite = $1 WHERE transaction_id = $2`,
+        [buildSecurityCode('VAL'), current.id]
+      );
     }
   });
 
@@ -503,60 +560,67 @@ export async function withdraw(actor, body) {
   );
   return rows[0];
 }
-
-const STATUS_MAP = {
-  pending: null,
-  processing: null,
-  completed: 'VALIDE',
-  success: 'VALIDE',
-  failed: 'ECHEC',
-  cancelled: 'ANNULE',
-  canceled: 'ANNULE',
-  expired: 'ECHEC',
-  declined: 'ECHEC',
-  rejected: 'ECHEC',
-  refunded: 'ANNULE',
-};
-
-export async function applyGatewayUpdate(data) {
-  const meta = data.metadata || {};
-  const reference = data.reference;
-  const localId = meta.transaction_id || meta.order_id || meta.transactionId;
+async function notifyTreasuryStaff(payload) {
   const { rows } = await pool.query(
-    `SELECT * FROM transactions
-     WHERE ($1::uuid IS NOT NULL AND id = $1::uuid)
-        OR ($2::text IS NOT NULL AND geniuspay_reference = $2)
-     LIMIT 1`,
-    [isUuid(localId) ? localId : null, reference || null]
+    `SELECT id FROM utilisateurs WHERE role IN ('TRESORIER', 'SUPER_ADMIN') AND actif = TRUE`
   );
-  const tx = rows[0];
-  if (!tx) return null;
-  const remoteStatus = String(data.status || '').toLowerCase();
-  const statut = STATUS_MAP[remoteStatus];
-  const methodKey = String(
-    data.payment_method || data.payment_provider || data.provider || ''
-  ).toLowerCase();
-  const method = GATEWAY_TO_LOCAL[methodKey];
-  await pool.query(
-    `UPDATE transactions
-     SET frais = COALESCE($2, frais),
-         montant_net = COALESCE($3, montant_net),
-         moyen_paiement = COALESCE($4, moyen_paiement),
-         updated_at = NOW()
-     WHERE id = $1`,
-    [tx.id, data.fees != null ? money(data.fees) : null, data.net_amount != null ? money(data.net_amount) : null, method || null]
-  );
-  if (!statut || tx.statut === statut || tx.statut === 'VALIDE') return tx.id;
-  try {
-    await setPaymentStatus(null, tx.id, statut);
-  } catch (error) {
-    if (error.status !== 409) throw error;
-  }
-  return tx.id;
+  await Promise.all(rows.map((row) => notify(row.id, payload)));
 }
 
-function isUuid(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+/** Valide directement le paiement en ligne réussi sans exiger de confirmation manuelle (seuls les versements en espèces nécessitent une confirmation). */
+export async function applySuccessfulPayment(tx, gpData = {}) {
+  if (tx.statut === 'VALIDE') return;
+
+  const fees = Math.round(Number(gpData.fees || 0));
+  const netAmount = Math.round(Number(gpData.net_amount || (Number(tx.montant) - fees)));
+
+  await withTx(async (client) => {
+    await client.query(
+      `UPDATE transactions
+       SET statut = 'VALIDE',
+           frais = $1,
+           montant_net = $2,
+           geniuspay_id = COALESCE($3, geniuspay_id),
+           geniuspay_reference = COALESCE($4, geniuspay_reference),
+           updated_at = NOW()
+       WHERE id = $5`,
+      [
+        fees,
+        netAmount,
+        gpData.id ? String(gpData.id) : null,
+        gpData.reference || null,
+        tx.id,
+      ]
+    );
+
+    const fresh = { ...tx, statut: 'VALIDE' };
+    await creditMovement(client, {
+      transaction: fresh,
+      auteur: 'Paiement en ligne (Automatique)',
+      auteurId: null,
+    });
+
+    await client.query(
+      `UPDATE recus SET code_securite = $1 WHERE transaction_id = $2`,
+      [buildSecurityCode('VAL'), tx.id]
+    );
+  });
+
+  if (tx.donateur_user_id) {
+    await notify(tx.donateur_user_id, {
+      titre: 'Paiement validé !',
+      message: `Votre versement de ${Number(tx.montant).toLocaleString('fr-FR')} FCFA (${tx.titre}) a été validé avec succès. Votre reçu officiel est disponible.`,
+      type: 'PAIEMENT',
+      referenceId: tx.id,
+    });
+  }
+
+  await notifyTreasuryStaff({
+    titre: 'Versement en ligne encaissé',
+    message: `${tx.donateur_nom} — ${Number(tx.montant).toLocaleString('fr-FR')} FCFA (${tx.titre}). Paiement en ligne validé et crédité automatiquement.`,
+    type: 'PAIEMENT',
+    referenceId: tx.id,
+  });
 }
 
 export async function syncPayment(user, id) {
@@ -565,28 +629,146 @@ export async function syncPayment(user, id) {
   const owner = tx.donateur_user_id === user.id;
   const staff = user.role === 'SUPER_ADMIN' || user.role === 'TRESORIER' || user.role === 'ADMINISTRATEUR';
   if (!owner && !staff) throw new AppError(403, 'Accès refusé.');
-  if (!tx.geniuspay_reference) return presentTransaction(tx);
-  let remote = null;
-  try {
-    remote = await getGeniusPayment(tx.geniuspay_reference);
-    await applyGatewayUpdate(remote);
-  } catch {
-    // En cas d'erreur de contact passerelle
-  }
-  const updated = await loadPaymentView(tx.id);
-  if (!updated) return presentTransaction(tx);
-  if (updated.statut === 'VALIDE') return presentTransaction(updated);
 
-  const remoteStatus = String(remote?.status || '').toLowerCase();
-  const mapped = STATUS_MAP[remoteStatus];
-  if (mapped && mapped !== updated.statut && updated.statut !== 'VALIDE') {
+  if (tx.statut === 'VALIDE') {
+    return presentTransaction(tx);
+  }
+
+  if (tx.geniuspay_reference && hasGeniusPayCredentials()) {
     try {
-      await setPaymentStatus(null, tx.id, mapped);
-    } catch (error) {
-      if (error.status !== 409) throw error;
+      const gp = await getPayment(tx.geniuspay_reference);
+      if (gp && gp.status === 'completed') {
+        await applySuccessfulPayment(tx, gp);
+        const refreshed = await loadPaymentView(tx.id);
+        return presentTransaction(refreshed);
+      } else if (gp && (gp.status === 'failed' || gp.status === 'cancelled' || gp.status === 'expired')) {
+        const newStatus = gp.status === 'failed' ? 'ECHEC' : 'ANNULE';
+        await pool.query(`UPDATE transactions SET statut = $1, updated_at = NOW() WHERE id = $2`, [
+          newStatus,
+          tx.id,
+        ]);
+        const refreshed = await loadPaymentView(tx.id);
+        return presentTransaction(refreshed);
+      }
+    } catch (err) {
+      console.warn(`[Sync GeniusPay Warning for tx ${tx.reference}]`, err.message);
     }
   }
-  return presentTransaction(await loadPaymentView(tx.id));
+
+  return presentTransaction(tx);
+}
+
+export async function syncPaymentByReference(reference, statusHint = null) {
+  if (!reference) return null;
+  let view = await loadPaymentView(reference);
+  if (!view) return null;
+
+  if (view.statut === 'VALIDE') {
+    return view;
+  }
+
+  // 1. Synchronisation via l'API GeniusPay
+  const gpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+  if (gpRef && hasGeniusPayCredentials()) {
+    try {
+      const gp = await getPayment(gpRef);
+      if (gp && gp.status === 'completed') {
+        await applySuccessfulPayment(view, gp);
+        return await loadPaymentView(view.id);
+      } else if (gp && (gp.status === 'failed' || gp.status === 'cancelled' || gp.status === 'expired')) {
+        const newStatus = gp.status === 'failed' ? 'ECHEC' : 'ANNULE';
+        await pool.query('UPDATE transactions SET statut = $1, updated_at = NOW() WHERE id = $2', [
+          newStatus,
+          view.id,
+        ]);
+        return await loadPaymentView(view.id);
+      }
+    } catch (err) {
+      console.warn(`[Sync GeniusPay Warning for ref ${reference}]`, err.message);
+    }
+  }
+
+  // 2. Si le retour de redirection indique succès et la transaction est encore en attente
+  if (statusHint === 'success' && view.statut === 'EN_ATTENTE') {
+    await applySuccessfulPayment(view, {
+      reference: view.geniuspay_reference || view.reference,
+      status: 'completed',
+    });
+    return await loadPaymentView(view.id);
+  }
+
+  // 3. Si le retour indique échec
+  if (statusHint === 'error' && view.statut === 'EN_ATTENTE') {
+    await pool.query(
+      `UPDATE transactions SET statut = 'ECHEC', motif_rejet = 'Échec ou annulation sur la passerelle de paiement', updated_at = NOW() WHERE id = $1`,
+      [view.id]
+    );
+    return await loadPaymentView(view.id);
+  }
+
+  return view;
+}
+
+export async function handleWebhookEvent(event, payload) {
+  const data = payload?.data || {};
+  const metadata = data?.metadata || {};
+  const txId = metadata.transaction_id;
+  const ref = metadata.order_id || metadata.reference || data.reference;
+
+  let tx = null;
+  if (txId) {
+    tx = await loadPaymentView(txId);
+  }
+  if (!tx && ref) {
+    tx = await loadPaymentView(ref);
+  }
+  if (!tx && (data.id || data.reference)) {
+    const { rows } = await pool.query(
+      `SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id
+       FROM transactions t
+       LEFT JOIN recus r ON r.transaction_id = t.id
+       WHERE t.geniuspay_id = $1 OR t.geniuspay_reference = $2
+       LIMIT 1`,
+      [String(data.id || ''), String(data.reference || '')]
+    );
+    tx = rows[0] || null;
+  }
+
+  if (!tx) {
+    console.warn(`[Webhook GeniusPay] Transaction non trouvée pour event ${event}`, {
+      ref,
+      txId,
+      gpId: data.id,
+    });
+    return { success: false, reason: 'Transaction introuvable' };
+  }
+
+  if (event === 'payment.success') {
+    await applySuccessfulPayment(tx, data);
+    return { success: true, status: 'EN_ATTENTE' };
+  } else if (event === 'payment.failed') {
+    await pool.query(
+      `UPDATE transactions SET statut = 'ECHEC', updated_at = NOW() WHERE id = $1`,
+      [tx.id]
+    );
+    if (tx.donateur_user_id) {
+      await notify(tx.donateur_user_id, {
+        titre: 'Paiement non abouti',
+        message: `Le versement de ${Number(tx.montant).toLocaleString('fr-FR')} FCFA pour ${tx.titre} n'a pas abouti.`,
+        type: 'PAIEMENT',
+        referenceId: tx.id,
+      });
+    }
+    return { success: true, status: 'ECHEC' };
+  } else if (event === 'payment.cancelled' || event === 'payment.expired') {
+    await pool.query(
+      `UPDATE transactions SET statut = 'ANNULE', updated_at = NOW() WHERE id = $1`,
+      [tx.id]
+    );
+    return { success: true, status: 'ANNULE' };
+  }
+
+  return { success: true, status: tx.statut };
 }
 
 export async function nextMatricule(client, role) {

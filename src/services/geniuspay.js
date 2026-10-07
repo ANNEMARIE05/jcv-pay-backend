@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { config, geniusCredentialsStatus } from '../config.js';
+import { config } from '../config.js';
 import { AppError } from '../errors.js';
 import { normalizePhone } from '../utils/phone.js';
 
@@ -9,271 +9,222 @@ const METHOD_MAP = {
   MTN_MOMO: 'mtn_money',
   MOOV_MONEY: 'moov_money',
   CARTE_BANCAIRE: 'card',
+  PAWAPAY: 'pawapay',
+  PAYSTACK: 'paystack',
 };
 
-export function isGatewayMethod(method) {
-  return Boolean(METHOD_MAP[method]);
+export function hasGeniusPayCredentials() {
+  return Boolean(config.geniuspay.apiKey && config.geniuspay.apiSecret);
 }
 
-export function geniusConfigured() {
-  return geniusCredentialsStatus().ok;
+export function mapPaymentMethod(method) {
+  if (!method) return undefined;
+  const upper = String(method).toUpperCase();
+  if (METHOD_MAP[upper]) return METHOD_MAP[upper];
+  const lower = String(method).toLowerCase();
+  const known = ['wave', 'orange_money', 'mtn_money', 'moov_money', 'card', 'pawapay', 'paystack'];
+  if (known.includes(lower)) return lower;
+  return undefined;
 }
 
-function configurationError() {
-  const status = geniusCredentialsStatus();
-  if (status.authMode === 'doc-partial') {
-    throw new AppError(
-      503,
-      'GeniusPay incomplet : il manque GENIUSPAY_PUBLIC_KEY (pk_sandbox_…). ' +
-        'La clé sk_… va dans GENIUSPAY_SECRET_KEY (X-API-Secret). ' +
-        'Ou renseignez sk_ + ss_ du dashboard dans PUBLIC_KEY et SECRET_KEY. ' +
-        'Voir https://geniuspay.ci/docs/api'
-    );
+function formatPhoneForGeniusPay(phone) {
+  if (!phone) return undefined;
+  const cleaned = String(phone).trim();
+  if (cleaned.startsWith('+')) return cleaned.replace(/\s+/g, '');
+  const digits = normalizePhone(cleaned);
+  if (!digits) return undefined;
+  if (digits.length === 10) return `+225${digits}`;
+  return `+${digits}`;
+}
+
+async function geniusPayRequest(path, options = {}) {
+  if (!hasGeniusPayCredentials()) {
+    throw new AppError(500, 'GeniusPay n’est pas configuré (clés API manquantes).');
   }
-  throw new AppError(
-    503,
-    'GeniusPay n’est pas configuré. Renseignez GENIUSPAY_PUBLIC_KEY et GENIUSPAY_SECRET_KEY — https://geniuspay.ci/docs/api'
-  );
-}
 
-function signRequest(signingSecret, rawBody) {
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signature = crypto
-    .createHmac('sha256', signingSecret)
-    .update(`${timestamp}.${rawBody || ''}`)
-    .digest('hex');
-  return { timestamp, signature };
-}
-
-/** Variantes d’auth pour le dashboard (sk + signature ss). */
-function dashboardAuthAttempts(apiKey, signingSecret, rawBody) {
-  const { timestamp, signature } = signRequest(signingSecret, rawBody);
-  return [
-    {
-      'X-API-Key': apiKey,
-      'X-API-Secret': signingSecret,
-    },
-    {
-      Authorization: `Bearer ${apiKey}`,
-      'X-API-Secret': signingSecret,
-    },
-    {
-      'X-API-Key': apiKey,
-      'X-Timestamp': timestamp,
-      'X-Signature': signature,
-    },
-    {
-      Authorization: `Bearer ${apiKey}`,
-      'X-Timestamp': timestamp,
-      'X-Signature': signature,
-    },
-    {
-      'X-API-Key': apiKey,
-      'X-Request-Timestamp': timestamp,
-      'X-Request-Signature': signature,
-    },
-    { 'X-API-Key': apiKey },
-    { Authorization: `Bearer ${apiKey}` },
-  ];
-}
-
-function docAuthHeaders() {
-  return {
-    'X-API-Key': config.genius.publicKey,
-    'X-API-Secret': config.genius.secretKey,
-  };
-}
-
-function formatCustomerPhone(phone) {
-  const digits = normalizePhone(phone);
-  return digits ? `+${digits}` : phone.replace(/\s/g, '');
-}
-
-async function geniusFetch(path, options = {}) {
-  if (!geniusConfigured()) configurationError();
-
-  const rawBody = typeof options.body === 'string' ? options.body : '';
-  const baseHeaders = {
+  const url = `${config.geniuspay.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+  const headers = {
+    'X-API-Key': config.geniuspay.apiKey,
+    'X-API-Secret': config.geniuspay.apiSecret,
+    'Content-Type': 'application/json',
     Accept: 'application/json',
-    ...(rawBody ? { 'Content-Type': 'application/json' } : {}),
     ...(options.headers || {}),
   };
 
-  const authAttempts =
-    config.genius.authMode === 'dashboard'
-      ? dashboardAuthAttempts(config.genius.publicKey, config.genius.secretKey, rawBody)
-      : [docAuthHeaders()];
-
-  let lastBody = {};
-  let lastStatus = 502;
-
-  for (let i = 0; i < authAttempts.length; i += 1) {
-    const response = await fetch(`${config.genius.baseUrl}${path}`, {
+  let response;
+  try {
+    response = await fetch(url, {
       ...options,
-      headers: { ...baseHeaders, ...authAttempts[i] },
+      headers,
     });
-    const body = await response.json().catch(() => ({}));
-    lastBody = body;
-    lastStatus = response.status;
-    if (response.ok && body.success !== false) return body;
-    if (response.status !== 401 || config.genius.authMode !== 'dashboard') break;
+  } catch (netErr) {
+    console.error('[GeniusPay Net Error]', netErr.message);
+    throw new AppError(502, `Connexion à GeniusPay impossible : ${netErr.message}`);
   }
 
-  const code = lastBody?.error?.code;
-  let message = lastBody?.error?.message || lastBody?.message || 'GeniusPay a refusé la requête.';
-  if (code === 'INVALID_API_KEY') {
-    message +=
-      ' Recopiez la clé sk_sandbox depuis Intégrations (sans espace) ou régénérez les clés Sandbox.';
-  }
-  throw new AppError(lastStatus || 502, message);
-}
-
-export async function createGeniusPayment({
-  amount,
-  method,
-  description,
-  customer,
-  transactionId,
-  userId,
-}) {
-  if (config.genius.simulate) {
-    return {
-      id: `sim_${Date.now()}`,
-      reference: `GP-SIM-${Date.now()}`,
-      checkout_url: `${config.publicBaseUrl}/paiement/simulation?tx=${transactionId}`,
-      environment: 'simulation',
-      fees: 0,
-      net_amount: amount,
-    };
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
   }
 
-  const payload = {
-    amount,
-    currency: 'XOF',
-    description: String(description || '').slice(0, 500),
-    customer: {
-      name: customer.name,
-      email: customer.email || undefined,
-      phone: formatCustomerPhone(customer.phone),
-      country: 'CI',
-    },
-    success_url: `${config.publicBaseUrl}/paiement/retour?status=success`,
-    error_url: `${config.publicBaseUrl}/paiement/retour?status=error`,
-    metadata: {
-      transaction_id: transactionId,
-      user_id: userId,
-      order_id: transactionId,
-    },
-  };
-
-  if (!config.genius.useHostedCheckout && METHOD_MAP[method]) {
-    payload.payment_method = METHOD_MAP[method];
-    payload.metadata.preferred_method = method;
-  } else if (METHOD_MAP[method]) {
-    payload.metadata.preferred_method = method;
+  if (!response.ok || (body && body.success === false)) {
+    const errorDetail = body?.error?.message || body?.message || response.statusText;
+    const errorCode = body?.error?.code || 'GENIUSPAY_ERROR';
+    console.error(`[GeniusPay API Error] Status ${response.status} (${errorCode}):`, errorDetail);
+    throw new AppError(
+      response.status >= 400 && response.status < 500 ? response.status : 502,
+      `Erreur GeniusPay [${errorCode}] : ${errorDetail}`
+    );
   }
 
-  const body = await geniusFetch('/payments', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  });
-  return body.data;
-}
-
-export async function getGeniusPayment(reference) {
-  if (config.genius.simulate || String(reference).startsWith('GP-SIM-')) {
-    return {
-      reference,
-      status: 'completed',
-      fees: 0,
-      net_amount: null,
-    };
-  }
-  const body = await geniusFetch(`/payments/${encodeURIComponent(reference)}`);
-  return body.data;
-}
-
-export async function listGeniusPayments(query = {}) {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (value != null && String(value).trim() !== '') params.set(key, String(value));
-  }
-  const qs = params.toString();
-  const body = await geniusFetch(`/payments${qs ? `?${qs}` : ''}`);
   return body;
 }
 
-export async function getGeniusBalance() {
-  if (config.genius.simulate) {
-    return { available: 0, pending: 0, total: 0 };
-  }
-  const body = await geniusFetch('/account/balance');
-  return body.data;
+/**
+ * Initier un paiement sur GeniusPay.
+ * Retourne les détails de la transaction GeniusPay et l'URL de paiement/checkout.
+ */
+export async function createPayment({
+  amount,
+  currency = 'XOF',
+  paymentMethod,
+  description,
+  customer = {},
+  metadata = {},
+  successUrl,
+  errorUrl,
+  gateway,
+  mmoProvider,
+}) {
+  const mappedMethod = mapPaymentMethod(paymentMethod);
+  const formattedPhone = formatPhoneForGeniusPay(customer.phone || customer.telephone);
+
+  const payload = {
+    amount: Math.round(Number(amount)),
+    currency: currency || 'XOF',
+    ...(mappedMethod ? { payment_method: mappedMethod } : {}),
+    ...(gateway ? { gateway } : {}),
+    ...(mmoProvider ? { mmo_provider: mmoProvider } : {}),
+    ...(description ? { description: String(description).slice(0, 500) } : {}),
+    customer: {
+      ...(customer.name ? { name: customer.name } : {}),
+      ...(customer.email ? { email: customer.email } : {}),
+      ...(formattedPhone ? { phone: formattedPhone } : {}),
+      country: customer.country || 'CI',
+    },
+    metadata: {
+      ...metadata,
+    },
+    ...(successUrl ? { success_url: successUrl } : {}),
+    ...(errorUrl ? { error_url: errorUrl } : {}),
+  };
+
+  const res = await geniusPayRequest('/payments', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+
+  return res.data;
 }
 
-const WEBHOOK_EVENTS = [
-  'payment.success',
-  'payment.failed',
-  'payment.cancelled',
-  'payment.expired',
-  'payment.refunded',
-];
-
-export async function ensureGeniusPayWebhook() {
-  if (!geniusConfigured()) return;
-  const targetUrl = `${config.publicBaseUrl}/api/webhooks/geniuspay`;
-  if (!/^https:\/\//i.test(config.publicBaseUrl)) {
-    console.log(
-      'GeniusPay : webhook non enregistré automatiquement (PUBLIC_BASE_URL en HTTP). ' +
-        'En local, la sync manuelle /api/paiements/:id/synchroniser suffit.'
-    );
-    return;
-  }
-  if (config.nodeEnv === 'production' && !/^https:\/\//i.test(config.publicBaseUrl)) {
-    console.warn('GeniusPay webhook : PUBLIC_BASE_URL doit être en HTTPS en production.');
-    return;
-  }
-  try {
-    const listed = await geniusFetch('/webhooks');
-    const hooks = Array.isArray(listed?.data) ? listed.data : listed?.data?.webhooks || [];
-    const exists = hooks.some(
-      (hook) => String(hook.url || '').replace(/\/$/, '') === targetUrl.replace(/\/$/, '')
-    );
-    if (exists) return;
-    const created = await geniusFetch('/webhooks', {
-      method: 'POST',
-      body: JSON.stringify({
-        name: 'JCV Pay',
-        url: targetUrl,
-        events: WEBHOOK_EVENTS,
-      }),
-    });
-    const secret = created?.data?.secret || created?.data?.signing_secret;
-    if (secret) {
-      console.warn(
-        'GeniusPay : webhook créé. Copiez ce secret dans GENIUSPAY_WEBHOOK_SECRET puis redémarrez :',
-        secret
-      );
-    } else {
-      console.log(`GeniusPay : webhook enregistré vers ${targetUrl}`);
-    }
-  } catch (error) {
-    console.warn('GeniusPay : enregistrement webhook ignoré —', error.message);
-  }
+/**
+ * Récupérer une transaction GeniusPay par sa référence (ex: SANDBOX_... ou MTX-...).
+ */
+export async function getPayment(reference) {
+  if (!reference) throw new AppError(400, 'Référence de transaction requise.');
+  const res = await geniusPayRequest(`/payments/${encodeURIComponent(reference)}`, {
+    method: 'GET',
+  });
+  return res.data;
 }
 
-export function verifyWebhookSignature({ rawBody, timestamp, signature }) {
-  const secret = config.genius.webhookSecret;
-  if (!secret) {
-    return config.nodeEnv !== 'production';
+/**
+ * Lister les paiements récents depuis GeniusPay.
+ */
+export async function listPayments(params = {}) {
+  const query = new URLSearchParams();
+  if (params.status) query.set('status', params.status);
+  if (params.paymentMethod) query.set('payment_method', mapPaymentMethod(params.paymentMethod) || params.paymentMethod);
+  if (params.from) query.set('from', params.from);
+  if (params.to) query.set('to', params.to);
+  if (params.search) query.set('search', params.search);
+  if (params.perPage) query.set('per_page', String(params.perPage));
+
+  const path = query.toString() ? `/payments?${query.toString()}` : '/payments';
+  const res = await geniusPayRequest(path, { method: 'GET' });
+  return res;
+}
+
+/**
+ * Obtenir les informations du compte marchand.
+ */
+export async function getAccount() {
+  const res = await geniusPayRequest('/account', { method: 'GET' });
+  return res.data;
+}
+
+/**
+ * Obtenir le solde disponible et en attente du compte.
+ */
+export async function getBalance() {
+  const res = await geniusPayRequest('/account/balance', { method: 'GET' });
+  return res.data;
+}
+
+/**
+ * Obtenir la liste des opérateurs MMO (PawaPay).
+ */
+export async function getPawaPayProviders(country = 'CI') {
+  const res = await geniusPayRequest(`/pawapay/providers?country=${encodeURIComponent(country)}`, {
+    method: 'GET',
+  });
+  return res.data;
+}
+
+/**
+ * Vérifier la signature HMAC-SHA256 d'un webhook GeniusPay.
+ * Format spec: signature = HMAC-SHA256(timestamp + "." + json_payload, secret)
+ */
+export function verifyWebhookSignature({
+  signature,
+  timestamp,
+  rawBody,
+  webhookSecret = config.geniuspay.webhookSecret,
+}) {
+  if (!signature) {
+    return { valid: false, reason: 'Header X-Webhook-Signature manquant' };
   }
-  if (!timestamp || !signature || !rawBody) return false;
-  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
-  if (!Number.isFinite(age) || age > 300) return false;
-  const expected = crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
-  const given = String(signature).replace(/^sha256=/i, '');
-  const a = Buffer.from(expected);
-  const b = Buffer.from(given);
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  if (!timestamp) {
+    return { valid: false, reason: 'Header X-Webhook-Timestamp manquant' };
+  }
+
+  // Protection replay attack : max 5 minutes (300 secondes)
+  const currentTs = Math.floor(Date.now() / 1000);
+  const sentTs = parseInt(timestamp, 10);
+  if (Number.isNaN(sentTs) || Math.abs(currentTs - sentTs) > 300) {
+    return { valid: false, reason: 'Timestamp trop ancien (replay attack)' };
+  }
+
+  // Si aucun webhookSecret n'est encore configuré dans l'environnement
+  if (!webhookSecret) {
+    return { valid: true, warning: 'Webhook secret non configuré, signature non vérifiée en mode dev' };
+  }
+
+  const payloadString = typeof rawBody === 'string' ? rawBody : JSON.stringify(rawBody || {});
+  const dataToSign = `${timestamp}.${payloadString}`;
+  const expectedSignature = crypto
+    .createHmac('sha256', webhookSecret)
+    .update(dataToSign)
+    .digest('hex');
+
+  const sigBuffer = Buffer.from(signature, 'utf8');
+  const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+
+  if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {
+    return { valid: false, reason: 'Signature HMAC invalide' };
+  }
+
+  return { valid: true };
 }

@@ -3,15 +3,31 @@ import { AppError, asyncHandler } from '../errors.js';
 import { requireAuth } from '../middleware/auth.js';
 import { buildEspace } from '../services/espace.js';
 import { declarePayment, loadPaymentView, syncPayment } from '../services/payments.js';
-import { presentReceipt } from '../services/present.js';
+import { presentReceipt, presentTransaction } from '../services/present.js';
+import { hasGeniusPayCredentials } from '../services/geniuspay.js';
+import { config } from '../config.js';
 
 const router = Router();
+
+router.get(
+  '/config',
+  asyncHandler(async (_req, res) => {
+    res.json({
+      geniuspayEnabled: hasGeniusPayCredentials(),
+      environment: config.geniuspay.environment,
+      supportedOnlineMethods: ['WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE'],
+    });
+  })
+);
 
 router.post(
   '/',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const created = await declarePayment(req.user, req.body);
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.headers['x-forwarded-host'] || req.headers.host;
+    const requestBaseUrl = host ? `${proto}://${host}` : null;
+    const created = await declarePayment(req.user, req.body, { requestBaseUrl });
     res.status(201).json({ ...created, espace: await buildEspace(req.user) });
   })
 );
@@ -21,7 +37,30 @@ router.post(
   requireAuth,
   asyncHandler(async (req, res) => {
     const transaction = await syncPayment(req.user, req.params.id);
-    res.json({ transaction, espace: await buildEspace(req.user) });
+    const view = await loadPaymentView(req.params.id);
+    const recu = view ? presentReceipt(view) : null;
+    res.json({ transaction, recu, espace: await buildEspace(req.user) });
+  })
+);
+
+router.get(
+  '/:id/statut',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const view = await loadPaymentView(req.params.id);
+    if (!view) throw new AppError(404, 'Paiement introuvable.');
+    const owner = view.donateur_user_id === req.user.id;
+    const staff = ['SUPER_ADMIN', 'ADMINISTRATEUR', 'TRESORIER'].includes(req.user.role);
+    if (!owner && !staff) throw new AppError(403, 'Accès refusé.');
+    res.json({
+      id: view.id,
+      reference: view.reference,
+      statut: view.statut,
+      moyenPaiement: view.moyen_paiement,
+      recuId: view.recu_id,
+      numeroRecu: view.numero_recu,
+      isCompleted: view.statut === 'VALIDE',
+    });
   })
 );
 
