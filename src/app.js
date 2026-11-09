@@ -30,7 +30,9 @@ export function createApp() {
   // ── Helmet : headers de sécurité HTTP ────────────────────────────────
   const secureHeaders = helmet({
     crossOriginEmbedderPolicy: false, // compatible mobile/web
+    hsts: isProd,
     contentSecurityPolicy: {
+      useDefaults: true,
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'", "'unsafe-inline'"],   // pour la page retour
@@ -39,10 +41,14 @@ export function createApp() {
         connectSrc: ["'self'"],
         frameSrc: ["'none'"],
         objectSrc: ["'none'"],
+        upgradeInsecureRequests: isProd ? [] : null,
       },
     },
   });
   app.use((req, res, next) => {
+    if (!isProd) {
+      res.setHeader('Strict-Transport-Security', 'max-age=0');
+    }
     if (req.path === '/api/docs' || req.path.startsWith('/api/docs/')) return next();
     secureHeaders(req, res, next);
   });
@@ -104,6 +110,8 @@ export function createApp() {
   app.get('/paiement/sandbox', async (req, res) => {
     const ref = String(req.query.ref || '').trim();
     const platform = String(req.query.platform || 'mobile').trim();
+    const appRedirect = String(req.query.app_redirect || '').trim();
+    const appRedirectParam = appRedirect ? `&app_redirect=${encodeURIComponent(appRedirect)}` : '';
     const view = ref ? await loadPaymentView(ref).catch(() => null) : null;
 
     const montantStr = view?.montant
@@ -114,9 +122,9 @@ export function createApp() {
     const phoneStr = view?.donateur_telephone || '';
     const moyenStr = view?.moyen_paiement || 'WAVE';
 
-    const successHref = `/paiement/retour?status=success&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}`;
-    const failHref = `/paiement/retour?status=error&ref=${encodeURIComponent(ref)}&reason=${encodeURIComponent('Solde insuffisant sur le compte Mobile Money')}&platform=${encodeURIComponent(platform)}`;
-    const cancelHref = `/paiement/retour?status=cancelled&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}`;
+    const successHref = `/paiement/retour?status=success&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}${appRedirectParam}`;
+    const failHref = `/paiement/retour?status=error&ref=${encodeURIComponent(ref)}&reason=${encodeURIComponent('Solde insuffisant sur le compte Mobile Money')}&platform=${encodeURIComponent(platform)}${appRedirectParam}`;
+    const cancelHref = `/paiement/retour?status=cancelled&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}${appRedirectParam}`;
 
     res.type('html').send(`<!doctype html>
       <html lang="fr">
@@ -281,6 +289,7 @@ export function createApp() {
     const ref = String(req.query.ref || '').trim();
     const reason = String(req.query.reason || req.query.error_message || req.query.msg || '').trim();
     const platform = String(req.query.platform || '').toLowerCase();
+    const appRedirect = String(req.query.app_redirect || '').trim();
 
     let view = null;
     if (ref) {
@@ -306,12 +315,19 @@ export function createApp() {
     const titreStr = view?.titre || 'Contribution Financière';
     const numeroRecu = view?.numero_recu || '';
 
-    // URL de redirection vers l'application mobile (deep link Expo scheme: jcvpay)
-    const deepLink = targetReceiptId
+    const routeTarget = targetReceiptId
       ? (isGatewayOk
-          ? `jcvpay://recu/${targetReceiptId}?choix=1`
-          : `jcvpay://recu/${targetReceiptId}?choix=1&error=1&motif=${encodeURIComponent(motifRejet)}`)
-      : (isGatewayOk ? 'jcvpay://recus' : `jcvpay://paiement?error=1&ref=${encodeURIComponent(ref)}&motif=${encodeURIComponent(motifRejet)}`);
+          ? `recu/${targetReceiptId}?choix=1`
+          : `recu/${targetReceiptId}?choix=1&error=1&motif=${encodeURIComponent(motifRejet)}`)
+      : (isGatewayOk
+          ? 'recus'
+          : `paiement?error=1&ref=${encodeURIComponent(ref)}&motif=${encodeURIComponent(motifRejet)}`);
+
+    // URL de redirection vers l'application mobile (Expo Go exp:// ou standalone jcvpay://)
+    const deepLink =
+      appRedirect && /^(exp|exps):\/\//i.test(appRedirect)
+        ? `${appRedirect.replace(/\/+$/, '')}/${routeTarget}`
+        : `jcvpay://${routeTarget}`;
 
     // URL de secours Web
     const webUrl = targetReceiptId

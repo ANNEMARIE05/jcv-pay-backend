@@ -28,7 +28,8 @@ router.post(
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const requestBaseUrl = host ? `${proto}://${host}` : null;
     const platform = req.body.platform || (req.headers['user-agent']?.toLowerCase().includes('mobile') ? 'mobile' : 'web');
-    const created = await declarePayment(req.user, req.body, { requestBaseUrl, platform });
+    const appRedirect = req.body.appRedirect || req.body.returnUrl || null;
+    const created = await declarePayment(req.user, req.body, { requestBaseUrl, platform, appRedirect });
     res.status(201).json({ ...created, espace: await buildEspace(req.user) });
   })
 );

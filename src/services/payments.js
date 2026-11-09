@@ -288,8 +288,10 @@ export async function declarePayment(user, body, options = {}) {
     try {
       const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
       const platformParam = encodeURIComponent(options.platform || body.platform || 'mobile');
-      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
-      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
+      const rawAppRedirect = options.appRedirect || body.appRedirect || '';
+      const appRedirectParam = rawAppRedirect ? `&app_redirect=${encodeURIComponent(rawAppRedirect)}` : '';
+      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
+      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
 
       let gp;
       try {
@@ -326,7 +328,7 @@ export async function declarePayment(user, body, options = {}) {
         gp = {
           id: `sim_${Date.now()}`,
           reference: simRef,
-          checkout_url: `${baseUrl}/paiement/sandbox?ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`,
+          checkout_url: `${baseUrl}/paiement/sandbox?ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`,
           environment: 'sandbox',
         };
       }
