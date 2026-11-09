@@ -10,7 +10,7 @@ import {
   money,
 } from '../utils/codes.js';
 import { presentReceipt, presentTransaction } from './present.js';
-import { notify, sourceBalance } from './espace.js';
+import { notify, principalAvailableBalance, sourceBalance } from './espace.js';
 import {
   createPayment,
   getPayment,
@@ -166,6 +166,7 @@ const CAISSE_BALANCE_SQL = `
     ), 0)
     + COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.destination_id = $1), 0)
     - COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.source_id = $1), 0)
+    - COALESCE((SELECT SUM(m.montant) FROM mouvements m WHERE m.type = 'SORTIE' AND m.caisse_id = $1), 0)
   ) AS solde
 `;
 
@@ -231,9 +232,11 @@ async function insertPayment(client, input) {
 
 export async function loadPaymentView(id) {
   const { rows } = await pool.query(
-    `SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id
+    `SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id,
+            u.prenom AS user_prenom, u.nom AS user_nom
      FROM transactions t
      LEFT JOIN recus r ON r.transaction_id = t.id
+     LEFT JOIN utilisateurs u ON u.id = t.donateur_user_id
      WHERE t.id::text = $1 OR t.reference = $1 OR r.numero_recu = $1 OR t.geniuspay_reference = $1 OR r.id::text = $1
      LIMIT 1`,
     [id]
@@ -256,6 +259,14 @@ export async function declarePayment(user, body, options = {}) {
     evenementId: body.evenementId,
     cotisationId: body.cotisationId,
   });
+  const userFullName = `${user.prenom || ''} ${user.nom || ''}`.trim();
+  const rawDonorName = String(body.donateurNom || '').trim();
+  const isAnonymousDonation =
+    Boolean(body.anonyme) || /^(donateur\s+)?anonyme$/i.test(rawDonorName);
+  const resolvedDonorName = isAnonymousDonation
+    ? `${userFullName || 'Donateur'} (en anonymat)`
+    : rawDonorName || userFullName;
+
   const base = {
     titre: String(body.titre).slice(0, 180),
     description: body.description,
@@ -267,7 +278,7 @@ export async function declarePayment(user, body, options = {}) {
     cotisationId: targets.cotisationId,
     caisseId: targets.caisseId,
     userId: user.id,
-    donateurNom: body.donateurNom || `${user.prenom} ${user.nom}`.trim(),
+    donateurNom: resolvedDonorName,
     donateurTelephone: telephone,
     donateurEmail: body.donateurEmail || user.email,
     donateurMatricule: user.matricule,
@@ -283,92 +294,109 @@ export async function declarePayment(user, body, options = {}) {
   );
 
   let checkoutUrl = null;
+  let autoValidatedOnline = false;
 
-  if (isOnline && hasGeniusPayCredentials() && !options.skipGeniusPay) {
-    try {
-      const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
-      const platformParam = encodeURIComponent(options.platform || body.platform || 'mobile');
-      const rawAppRedirect = options.appRedirect || body.appRedirect || '';
-      const appRedirectParam = rawAppRedirect ? `&app_redirect=${encodeURIComponent(rawAppRedirect)}` : '';
-      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
-      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
-
-      let gp;
+  if (isOnline && !options.skipGeniusPay) {
+    if (hasGeniusPayCredentials()) {
       try {
-        gp = await createPayment({
-          amount: montant,
-          paymentMethod: moyen,
-          description: `${base.titre} — ${base.donateurNom}`,
-          customer: {
-            name: base.donateurNom,
-            email: base.donateurEmail,
-            phone: telephone,
-          },
-          metadata: {
-            transaction_id: created.transaction.id,
-            reference: created.transaction.reference,
-            order_id: created.transaction.reference,
-            donateur_user_id: user.id,
-            type: body.type,
-          },
-          successUrl,
-          errorUrl,
-        });
-      } catch (apiErr) {
-        const isSandboxQuotaExhausted =
-          config.geniuspay.environment === 'sandbox' &&
-          /no tokens remaining|sandbox access denied/i.test(apiErr.message);
-        if (!isSandboxQuotaExhausted) {
-          throw apiErr;
+        const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
+        const platformParam = encodeURIComponent(options.platform || body.platform || 'mobile');
+        const rawAppRedirect = options.appRedirect || body.appRedirect || '';
+        const appRedirectParam = rawAppRedirect ? `&app_redirect=${encodeURIComponent(rawAppRedirect)}` : '';
+        const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
+        const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`;
+
+        let gp;
+        try {
+          gp = await createPayment({
+            amount: montant,
+            paymentMethod: moyen,
+            description: `${base.titre} — ${base.donateurNom}`,
+            customer: {
+              name: base.donateurNom,
+              email: base.donateurEmail,
+              phone: telephone,
+            },
+            metadata: {
+              transaction_id: created.transaction.id,
+              reference: created.transaction.reference,
+              order_id: created.transaction.reference,
+              donateur_user_id: user.id,
+              type: body.type,
+            },
+            successUrl,
+            errorUrl,
+          });
+        } catch (apiErr) {
+          const isSandboxQuotaExhausted =
+            config.geniuspay.environment === 'sandbox' &&
+            /no tokens remaining|sandbox access denied/i.test(apiErr.message);
+          if (!isSandboxQuotaExhausted) {
+            throw apiErr;
+          }
+          const simRef = `SANDBOX_SIM_${created.transaction.reference}`;
+          console.warn(
+            `[GeniusPay Sandbox] Jetons Sandbox épuisés (0) — validation directe du paiement en ligne (${simRef}).`
+          );
+          gp = {
+            id: `sim_${Date.now()}`,
+            reference: simRef,
+            checkout_url: null,
+            environment: 'sandbox',
+            status: 'completed',
+          };
         }
-        const simRef = `SANDBOX_SIM_${created.transaction.reference}`;
-        console.warn(
-          `[GeniusPay Sandbox] Jetons Sandbox épuisés (0) — bascule sur le simulateur checkout local (${simRef}).`
+
+        checkoutUrl = gp.checkout_url || gp.payment_url || null;
+
+        await pool.query(
+          `UPDATE transactions
+           SET geniuspay_id = $1,
+               geniuspay_reference = $2,
+               checkout_url = $3,
+               environnement = $4,
+               updated_at = NOW()
+           WHERE id = $5`,
+          [
+            gp.id ? String(gp.id) : null,
+            gp.reference || null,
+            checkoutUrl,
+            gp.environment || config.geniuspay.environment,
+            created.transaction.id,
+          ]
         );
-        gp = {
-          id: `sim_${Date.now()}`,
-          reference: simRef,
-          checkout_url: `${baseUrl}/paiement/sandbox?ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}${appRedirectParam}`,
-          environment: 'sandbox',
-        };
-      }
 
-      checkoutUrl = gp.checkout_url || gp.payment_url || null;
-
-      await pool.query(
-        `UPDATE transactions
-         SET geniuspay_id = $1,
-             geniuspay_reference = $2,
-             checkout_url = $3,
-             environnement = $4,
-             updated_at = NOW()
-         WHERE id = $5`,
-        [
-          gp.id ? String(gp.id) : null,
-          gp.reference || null,
-          checkoutUrl,
-          gp.environment || config.geniuspay.environment,
+        if (gp.status === 'completed' || !checkoutUrl) {
+          await applySuccessfulPayment(created.transaction, gp);
+          autoValidatedOnline = true;
+        }
+      } catch (gpErr) {
+        console.error('[GeniusPay Initiation Error]', gpErr.message);
+        await pool.query(`UPDATE transactions SET statut = 'ECHEC', motif_rejet = $2 WHERE id = $1`, [
           created.transaction.id,
-        ]
-      );
-    } catch (gpErr) {
-      console.error('[GeniusPay Initiation Error]', gpErr.message);
-      await pool.query(`UPDATE transactions SET statut = 'ECHEC', motif_rejet = $2 WHERE id = $1`, [
-        created.transaction.id,
-        `Échec d’initialisation de paiement : ${gpErr.message}`,
-      ]);
-      throw gpErr;
+          `Échec d’initialisation de paiement : ${gpErr.message}`,
+        ]);
+        throw gpErr;
+      }
+    } else {
+      await applySuccessfulPayment(created.transaction, {
+        reference: created.transaction.reference,
+        status: 'completed',
+      });
+      autoValidatedOnline = true;
     }
   }
 
-  await notify(user.id, {
-    titre: isOnline ? 'Paiement initié' : 'Versement déclaré',
-    message: isOnline
-      ? `${base.titre} — Veuillez finaliser le paiement sur GeniusPay.`
-      : `${base.titre} est en attente de confirmation par la trésorerie.`,
-    type: 'PAIEMENT',
-    referenceId: created.transaction.id,
-  });
+  if (!autoValidatedOnline) {
+    await notify(user.id, {
+      titre: isOnline ? 'Paiement initié' : 'Versement déclaré',
+      message: isOnline
+        ? `${base.titre} — Veuillez finaliser le paiement sur GeniusPay.`
+        : `${base.titre} est en attente de confirmation par la trésorerie.`,
+      type: 'PAIEMENT',
+      referenceId: created.transaction.id,
+    });
+  }
 
   const view = await loadPaymentView(created.transaction.id);
   return {
@@ -461,6 +489,9 @@ export async function setPaymentStatus(actor, id, statut, motifRejet = null) {
   if (current.statut === statut) return presentTransaction(current);
   if (current.statut === 'VALIDE' && statut !== 'VALIDE') {
     throw new AppError(409, 'Un versement déjà validé ne peut plus être modifié.');
+  }
+  if (statut === 'VALIDE' && current.moyen_paiement !== 'ESPECES') {
+    throw new AppError(400, 'Seuls les paiements en espèces nécessitent une confirmation manuelle.');
   }
 
   await withTx(async (client) => {
@@ -567,10 +598,30 @@ async function lockCaisse(client, id) {
 
 export async function withdraw(actor, body) {
   const montant = money(body.montant);
-  const source = body.source;
+  const source = body.source || 'CAISSE_PHYSIQUE';
   if (!body.motif || montant <= 0 || !source) throw new AppError(400, 'Montant, motif et caisse sont requis.');
-  const solde = await sourceBalance(source);
-  if (montant > solde) return null;
+
+  const rawCaisseId =
+    body.caisseProjetId && body.caisseProjetId !== 'principale'
+      ? String(body.caisseProjetId).trim()
+      : null;
+
+  if (rawCaisseId) {
+    if (!isUuid(rawCaisseId)) throw new AppError(400, 'Caisse invalide.');
+    const caisseRow = (await pool.query('SELECT * FROM caisses WHERE id = $1', [rawCaisseId])).rows[0];
+    if (!caisseRow || caisseRow.supprimee) throw new AppError(404, 'Caisse introuvable.');
+    if (caisseRow.statut === 'TERMINEE') throw new AppError(409, 'Cette caisse est clôturée.');
+    const soldeCaisse = await caisseBalance(pool, rawCaisseId);
+    if (montant > soldeCaisse) return null;
+  } else {
+    const [soldePrincipale, soldeSource] = await Promise.all([
+      principalAvailableBalance(),
+      sourceBalance(source),
+    ]);
+    const disponible = Math.max(soldePrincipale, soldeSource);
+    if (montant > disponible) return null;
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO mouvements (type, montant, motif, source, auteur, auteur_id, beneficiaire, caisse_id)
      VALUES ('SORTIE', $1, $2, $3, $4, $5, $6, $7) RETURNING *`,
@@ -581,7 +632,7 @@ export async function withdraw(actor, body) {
       body.auteur || `${actor.prenom} ${actor.nom}`.trim(),
       actor.id,
       body.beneficiaire || null,
-      body.caisseProjetId || null,
+      rawCaisseId,
     ]
   );
   return rows[0];
@@ -659,6 +710,18 @@ export async function syncPayment(user, id) {
 
   if (tx.statut === 'VALIDE') {
     return presentTransaction(tx);
+  }
+
+  if (
+    tx.moyen_paiement !== 'ESPECES' &&
+    String(tx.geniuspay_reference || '').startsWith('SANDBOX_SIM_')
+  ) {
+    await applySuccessfulPayment(tx, {
+      reference: tx.geniuspay_reference,
+      status: 'completed',
+    });
+    const refreshed = await loadPaymentView(tx.id);
+    return presentTransaction(refreshed);
   }
 
   if (

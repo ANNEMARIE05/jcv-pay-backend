@@ -13,9 +13,11 @@ import {
 } from './present.js';
 
 const TX_SELECT = `
-  SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id
+  SELECT t.*, r.numero_recu, r.code_securite, r.id AS recu_id, r.transaction_id,
+         u.prenom AS user_prenom, u.nom AS user_nom
   FROM transactions t
   LEFT JOIN recus r ON r.transaction_id = t.id
+  LEFT JOIN utilisateurs u ON u.id = t.donateur_user_id
 `;
 
 export async function buildEspace(user) {
@@ -69,6 +71,7 @@ export async function buildEspace(user) {
              ), 0)
              + COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.destination_id = c.id), 0)
              - COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.source_id = c.id), 0)
+             - COALESCE((SELECT SUM(m.montant) FROM mouvements m WHERE m.type = 'SORTIE' AND m.caisse_id = c.id), 0)
            ) AS montant_collecte
          FROM caisses c
          WHERE c.supprimee = FALSE
@@ -214,6 +217,26 @@ export async function sourceBalance(source) {
     [source]
   );
   return Number(rows[0].solde);
+}
+
+export async function principalAvailableBalance() {
+  const [movRes, caissesRes] = await Promise.all([
+    pool.query(`
+      SELECT COALESCE(SUM(CASE WHEN type = 'ENTREE' THEN montant ELSE -montant END), 0) AS solde_total
+      FROM mouvements
+    `),
+    pool.query(`
+      SELECT COALESCE(SUM(
+        COALESCE((SELECT SUM(t.montant) FROM transactions t WHERE t.statut = 'VALIDE' AND t.caisse_id = c.id), 0)
+        + COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.destination_id = c.id), 0)
+        - COALESCE((SELECT SUM(tr.montant) FROM transferts tr WHERE tr.source_id = c.id), 0)
+        - COALESCE((SELECT SUM(m.montant) FROM mouvements m WHERE m.type = 'SORTIE' AND m.caisse_id = c.id), 0)
+      ), 0) AS locked
+      FROM caisses c
+      WHERE c.supprimee = FALSE AND c.principale = FALSE
+    `),
+  ]);
+  return Number(movRes.rows[0].solde_total) - Number(caissesRes.rows[0].locked);
 }
 
 export async function notify(userId, payload) {

@@ -18,6 +18,15 @@ export function presentUser(row) {
   };
 }
 
+function formatDonateurNom(row) {
+  const raw = String(row.donateur_nom || '').trim();
+  const userFull = `${row.user_prenom || ''} ${row.user_nom || ''}`.trim();
+  if (!raw || /^(donateur\s+)?anonyme$/i.test(raw)) {
+    return userFull ? `${userFull} (en anonymat)` : 'Donateur (en anonymat)';
+  }
+  return raw;
+}
+
 export function presentTransaction(row) {
   return {
     id: row.id,
@@ -34,7 +43,7 @@ export function presentTransaction(row) {
     projetId: row.projet_id || undefined,
     evenementId: row.evenement_id || undefined,
     cotisationId: row.cotisation_id || undefined,
-    donateurNom: row.donateur_nom,
+    donateurNom: formatDonateurNom(row),
     donateurTelephone: row.donateur_telephone,
     checkoutUrl: row.checkout_url || undefined,
     motifRejet: row.motif_rejet || undefined,
@@ -51,7 +60,7 @@ export function presentReceipt(row) {
     transactionId: txId || '',
     titre: row.titre || '',
     type: row.type || 'LIBRE',
-    donateurNom: row.donateur_nom || '',
+    donateurNom: formatDonateurNom(row),
     donateurMatricule: row.donateur_matricule || '',
     donateurTelephone: row.donateur_telephone || '',
     donateurEmail: row.donateur_email || '',

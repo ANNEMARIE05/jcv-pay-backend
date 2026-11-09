@@ -303,8 +303,7 @@ export function createApp() {
     const isValide = view?.statut === 'VALIDE';
     const isPendingTreasury =
       view?.statut === 'EN_ATTENTE' &&
-      view?.montant_net != null &&
-      Boolean(view?.geniuspay_id || view?.geniuspay_reference);
+      view?.moyen_paiement === 'ESPECES';
     const isGatewayOk = isValide || isPendingTreasury || (isSuccess && Boolean(view?.recu_id));
     const recuId = view?.recu_id || '';
     const txId = view?.id || '';
