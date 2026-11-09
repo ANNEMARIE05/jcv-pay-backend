@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   geniuspay_reference TEXT UNIQUE,
   checkout_url TEXT,
   environnement TEXT,
+  motif_rejet TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

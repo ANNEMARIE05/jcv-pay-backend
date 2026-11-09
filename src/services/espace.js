@@ -90,20 +90,34 @@ export async function buildEspace(user) {
 
   const txRows = transactions.rows;
   const mine = txRows.filter((row) => row.donateur_user_id === user.id);
-  const totalContribue = mine
+  const targetTx = staff ? txRows : mine;
+
+  const totalToutesTransactions = targetTx.reduce((sum, row) => sum + Number(row.montant), 0);
+  const totalTransactionsCount = targetTx.length;
+  const totalTransactionsValidees = targetTx
     .filter((row) => row.statut === 'VALIDE')
     .reduce((sum, row) => sum + Number(row.montant), 0);
-  const enAttente = mine
+  const countTransactionsValidees = targetTx.filter((row) => row.statut === 'VALIDE').length;
+  const totalTransactionsEnAttente = targetTx
     .filter((row) => row.statut === 'EN_ATTENTE')
     .reduce((sum, row) => sum + Number(row.montant), 0);
-  const epargneSolde = mine
+  const countTransactionsEnAttente = targetTx.filter((row) => row.statut === 'EN_ATTENTE').length;
+  const totalTransactionsEchec = targetTx
+    .filter((row) => row.statut === 'ECHEC' || row.statut === 'REJETE' || row.statut === 'ANNULE')
+    .reduce((sum, row) => sum + Number(row.montant), 0);
+  const countTransactionsEchec = targetTx
+    .filter((row) => row.statut === 'ECHEC' || row.statut === 'REJETE' || row.statut === 'ANNULE').length;
+
+  const totalContribue = totalTransactionsValidees;
+  const enAttente = totalTransactionsEnAttente;
+  const epargneSolde = targetTx
     .filter((row) => row.statut === 'VALIDE' && row.type === 'EPARGNE')
     .reduce((sum, row) => sum + Number(row.montant), 0);
   const resteAPayer = cotisations.rows.reduce((sum, row) => {
     const reste = Math.max(Number(row.montant_total) - Number(row.montant_verse || 0), 0);
     return sum + reste;
   }, 0);
-  const last = mine.find((row) => row.statut === 'VALIDE') || mine[0];
+  const last = targetTx.find((row) => row.statut === 'VALIDE') || targetTx[0];
 
   const mouvements = money
     ? await pool.query('SELECT * FROM mouvements ORDER BY created_at DESC LIMIT 200')
@@ -120,6 +134,14 @@ export async function buildEspace(user) {
 
   return {
     resume: {
+      totalToutesTransactions,
+      totalTransactionsCount,
+      totalTransactionsValidees,
+      countTransactionsValidees,
+      totalTransactionsEnAttente,
+      countTransactionsEnAttente,
+      totalTransactionsEchec,
+      countTransactionsEchec,
       totalContribue,
       resteAPayer,
       enAttente,

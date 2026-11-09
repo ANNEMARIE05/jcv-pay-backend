@@ -37,6 +37,7 @@ export function presentTransaction(row) {
     donateurNom: row.donateur_nom,
     donateurTelephone: row.donateur_telephone,
     checkoutUrl: row.checkout_url || undefined,
+    motifRejet: row.motif_rejet || undefined,
     passerelleConfirmee: false,
   };
 }
@@ -61,6 +62,7 @@ export function presentReceipt(row) {
     heure: formatHeure(row.created_at),
     statut: row.statut || 'EN_ATTENTE',
     moyenPaiement: row.moyen_paiement || 'ESPECES',
+    motifRejet: row.motif_rejet || undefined,
     egliseNom: config.org.nom,
     egliseAdresse: config.org.adresse,
     codeSecurite: row.code_securite || '',

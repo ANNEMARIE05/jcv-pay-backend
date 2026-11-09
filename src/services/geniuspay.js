@@ -51,11 +51,13 @@ async function geniusPayRequest(path, options = {}) {
     ...(options.headers || {}),
   };
 
+  const timeoutMs = options.timeoutMs || 10000;
   let response;
   try {
     response = await fetch(url, {
       ...options,
       headers,
+      signal: options.signal || AbortSignal.timeout(timeoutMs),
     });
   } catch (netErr) {
     console.error('[GeniusPay Net Error]', netErr.message);
@@ -132,10 +134,11 @@ export async function createPayment({
 /**
  * Récupérer une transaction GeniusPay par sa référence (ex: SANDBOX_... ou MTX-...).
  */
-export async function getPayment(reference) {
+export async function getPayment(reference, options = {}) {
   if (!reference) throw new AppError(400, 'Référence de transaction requise.');
   const res = await geniusPayRequest(`/payments/${encodeURIComponent(reference)}`, {
     method: 'GET',
+    ...options,
   });
   return res.data;
 }

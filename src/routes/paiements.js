@@ -27,7 +27,8 @@ router.post(
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const requestBaseUrl = host ? `${proto}://${host}` : null;
-    const created = await declarePayment(req.user, req.body, { requestBaseUrl });
+    const platform = req.body.platform || (req.headers['user-agent']?.toLowerCase().includes('mobile') ? 'mobile' : 'web');
+    const created = await declarePayment(req.user, req.body, { requestBaseUrl, platform });
     res.status(201).json({ ...created, espace: await buildEspace(req.user) });
   })
 );
@@ -59,6 +60,7 @@ router.get(
       moyenPaiement: view.moyen_paiement,
       recuId: view.recu_id,
       numeroRecu: view.numero_recu,
+      motifRejet: view.motif_rejet || null,
       isCompleted: view.statut === 'VALIDE',
     });
   })

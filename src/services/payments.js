@@ -280,15 +280,16 @@ export async function declarePayment(user, body, options = {}) {
   const isOnline = ['WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE'].includes(moyen);
   let checkoutUrl = null;
 
-  if (isOnline && hasGeniusPayCredentials()) {
+  if (isOnline && hasGeniusPayCredentials() && !options.skipGeniusPay) {
     if (montant < 200) {
       throw new AppError(400, 'Le montant minimum pour un paiement en ligne est de 200 FCFA.');
     }
 
     try {
       const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
-      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}`;
-      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}`;
+      const platformParam = encodeURIComponent(options.platform || body.platform || 'mobile');
+      const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
+      const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
 
       const gp = await createPayment({
         amount: montant,
@@ -330,7 +331,10 @@ export async function declarePayment(user, body, options = {}) {
       );
     } catch (gpErr) {
       console.error('[GeniusPay Initiation Error]', gpErr.message);
-      await pool.query(`UPDATE transactions SET statut = 'ECHEC' WHERE id = $1`, [created.transaction.id]);
+      await pool.query(`UPDATE transactions SET statut = 'ECHEC', motif_rejet = $2 WHERE id = $1`, [
+        created.transaction.id,
+        `Échec d’initialisation de paiement : ${gpErr.message}`,
+      ]);
       throw gpErr;
     }
   }
@@ -429,7 +433,7 @@ async function creditMovement(client, { transaction, auteur, auteurId }) {
   }
 }
 
-export async function setPaymentStatus(actor, id, statut) {
+export async function setPaymentStatus(actor, id, statut, motifRejet = null) {
   const current = await loadPaymentView(id);
   if (!current) throw new AppError(404, 'Versement introuvable.');
   if (current.statut === statut) return presentTransaction(current);
@@ -438,10 +442,10 @@ export async function setPaymentStatus(actor, id, statut) {
   }
 
   await withTx(async (client) => {
-    await client.query(`UPDATE transactions SET statut = $2, updated_at = NOW() WHERE id = $1`, [
-      current.id,
-      statut,
-    ]);
+    await client.query(
+      `UPDATE transactions SET statut = $2, motif_rejet = COALESCE($3, motif_rejet), updated_at = NOW() WHERE id = $1`,
+      [current.id, statut, motifRejet]
+    );
     if (statut === 'VALIDE') {
       const fresh = { ...current, statut: 'VALIDE' };
       await creditMovement(client, {
@@ -461,7 +465,7 @@ export async function setPaymentStatus(actor, id, statut) {
     message:
       statut === 'VALIDE'
         ? `${current.titre} est confirmé. Votre reçu est disponible.`
-        : `${current.titre} n’a pas été confirmé.`,
+        : `${current.titre} n’a pas été confirmé${motifRejet ? ` (${motifRejet})` : ''}.`,
     type: 'PAIEMENT',
     referenceId: current.id,
   });
@@ -567,7 +571,7 @@ async function notifyTreasuryStaff(payload) {
   await Promise.all(rows.map((row) => notify(row.id, payload)));
 }
 
-/** Valide directement le paiement en ligne réussi sans exiger de confirmation manuelle (seuls les versements en espèces nécessitent une confirmation). */
+/** Valide directement le paiement en ligne réussi sans exiger de confirmation manuelle. */
 export async function applySuccessfulPayment(tx, gpData = {}) {
   if (tx.statut === 'VALIDE') return;
 
@@ -580,6 +584,7 @@ export async function applySuccessfulPayment(tx, gpData = {}) {
        SET statut = 'VALIDE',
            frais = $1,
            montant_net = $2,
+           motif_rejet = NULL,
            geniuspay_id = COALESCE($3, geniuspay_id),
            geniuspay_reference = COALESCE($4, geniuspay_reference),
            updated_at = NOW()
@@ -636,17 +641,25 @@ export async function syncPayment(user, id) {
 
   if (tx.geniuspay_reference && hasGeniusPayCredentials()) {
     try {
-      const gp = await getPayment(tx.geniuspay_reference);
+      const gp = await getPayment(tx.geniuspay_reference, { timeoutMs: 3000 });
       if (gp && gp.status === 'completed') {
         await applySuccessfulPayment(tx, gp);
         const refreshed = await loadPaymentView(tx.id);
         return presentTransaction(refreshed);
-      } else if (gp && (gp.status === 'failed' || gp.status === 'cancelled' || gp.status === 'expired')) {
-        const newStatus = gp.status === 'failed' ? 'ECHEC' : 'ANNULE';
-        await pool.query(`UPDATE transactions SET statut = $1, updated_at = NOW() WHERE id = $2`, [
-          newStatus,
-          tx.id,
-        ]);
+      } else if (gp && ['failed', 'rejected', 'declined', 'cancelled', 'canceled', 'expired', 'timeout'].includes(gp.status)) {
+        const isCancelled = gp.status === 'cancelled' || gp.status === 'canceled';
+        const newStatus = isCancelled ? 'ANNULE' : 'ECHEC';
+        const reason = gp.failure_reason || gp.error_message || gp.decline_reason || (
+          isCancelled
+            ? 'Paiement annulé par l’utilisateur.'
+            : gp.status === 'expired' || gp.status === 'timeout'
+              ? 'Délai d’authentification de paiement expiré.'
+              : 'Paiement rejeté ou refusé par l’opérateur (solde insuffisant ou rejet banque).'
+        );
+        await pool.query(
+          `UPDATE transactions SET statut = $1, motif_rejet = $2, updated_at = NOW() WHERE id = $3`,
+          [newStatus, reason, tx.id]
+        );
         const refreshed = await loadPaymentView(tx.id);
         return presentTransaction(refreshed);
       }
@@ -658,7 +671,7 @@ export async function syncPayment(user, id) {
   return presentTransaction(tx);
 }
 
-export async function syncPaymentByReference(reference, statusHint = null) {
+export async function syncPaymentByReference(reference, statusHint = null, reasonHint = null) {
   if (!reference) return null;
   let view = await loadPaymentView(reference);
   if (!view) return null;
@@ -667,20 +680,80 @@ export async function syncPaymentByReference(reference, statusHint = null) {
     return view;
   }
 
-  // 1. Synchronisation via l'API GeniusPay
+  // 1. Si statusHint === 'success' : Validation rapide instantanée (sans délai réseau externe)
+  if (statusHint === 'success') {
+    if (view.statut === 'EN_ATTENTE') {
+      await applySuccessfulPayment(view, {
+        reference: view.geniuspay_reference || view.reference,
+        status: 'completed',
+      });
+      // Requête asynchrone non bloquante pour récupérer les détails de frais si besoin
+      const gpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+      if (gpRef && hasGeniusPayCredentials()) {
+        getPayment(gpRef, { timeoutMs: 1500 })
+          .then((gp) => {
+            if (gp?.fees != null || gp?.net_amount != null) {
+              const fees = Math.round(Number(gp.fees || 0));
+              const net = Math.round(Number(gp.net_amount || (Number(view.montant) - fees)));
+              pool.query(
+                'UPDATE transactions SET frais = $1, montant_net = $2, updated_at = NOW() WHERE id = $3',
+                [fees, net, view.id]
+              ).catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
+      return await loadPaymentView(view.id);
+    }
+    return view;
+  }
+
+  // 2. Si le retour de passerelle indique échec ou annulation
+  if (statusHint === 'error' || statusHint === 'failed' || statusHint === 'cancelled' || statusHint === 'canceled') {
+    const isCancelled = statusHint === 'cancelled' || statusHint === 'canceled';
+    const newStatus = isCancelled ? 'ANNULE' : 'ECHEC';
+    const reason = reasonHint || (
+      isCancelled
+        ? 'Paiement annulé par le donateur.'
+        : 'Paiement refusé ou non validé par l’opérateur (solde insuffisant ou rejet carte/mobile).'
+    );
+    await pool.query(
+      `UPDATE transactions SET statut = $1, motif_rejet = $2, updated_at = NOW() WHERE id = $3`,
+      [newStatus, reason, view.id]
+    );
+    if (view.donateur_user_id) {
+      await notify(view.donateur_user_id, {
+        titre: isCancelled ? 'Paiement annulé' : 'Paiement non abouti',
+        message: `${view.titre} — ${reason}`,
+        type: 'PAIEMENT',
+        referenceId: view.id,
+      });
+    }
+    return await loadPaymentView(view.id);
+  }
+
+  // 3. Synchronisation via l'API GeniusPay avec timeout strict pour ne pas ralentir le retour
   const gpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
   if (gpRef && hasGeniusPayCredentials()) {
     try {
-      const gp = await getPayment(gpRef);
+      const gp = await getPayment(gpRef, { timeoutMs: 2500 });
       if (gp && gp.status === 'completed') {
         await applySuccessfulPayment(view, gp);
         return await loadPaymentView(view.id);
-      } else if (gp && (gp.status === 'failed' || gp.status === 'cancelled' || gp.status === 'expired')) {
-        const newStatus = gp.status === 'failed' ? 'ECHEC' : 'ANNULE';
-        await pool.query('UPDATE transactions SET statut = $1, updated_at = NOW() WHERE id = $2', [
-          newStatus,
-          view.id,
-        ]);
+      } else if (gp && ['failed', 'rejected', 'declined', 'cancelled', 'canceled', 'expired', 'timeout'].includes(gp.status)) {
+        const isCancelled = gp.status === 'cancelled' || gp.status === 'canceled';
+        const newStatus = isCancelled ? 'ANNULE' : 'ECHEC';
+        const reason = gp.failure_reason || gp.error_message || gp.decline_reason || (
+          isCancelled
+            ? 'Paiement annulé par le donateur.'
+            : gp.status === 'expired' || gp.status === 'timeout'
+              ? 'Délai d’authentification expiré.'
+              : 'Paiement refusé ou rejeté par l’opérateur.'
+        );
+        await pool.query(
+          `UPDATE transactions SET statut = $1, motif_rejet = $2, updated_at = NOW() WHERE id = $3`,
+          [newStatus, reason, view.id]
+        );
         return await loadPaymentView(view.id);
       }
     } catch (err) {
@@ -688,31 +761,13 @@ export async function syncPaymentByReference(reference, statusHint = null) {
     }
   }
 
-  // 2. Si le retour de redirection indique succès et la transaction est encore en attente
-  if (statusHint === 'success' && view.statut === 'EN_ATTENTE') {
-    await applySuccessfulPayment(view, {
-      reference: view.geniuspay_reference || view.reference,
-      status: 'completed',
-    });
-    return await loadPaymentView(view.id);
-  }
-
-  // 3. Si le retour indique échec
-  if (statusHint === 'error' && view.statut === 'EN_ATTENTE') {
-    await pool.query(
-      `UPDATE transactions SET statut = 'ECHEC', motif_rejet = 'Échec ou annulation sur la passerelle de paiement', updated_at = NOW() WHERE id = $1`,
-      [view.id]
-    );
-    return await loadPaymentView(view.id);
-  }
-
   return view;
 }
 
 export async function handleWebhookEvent(event, payload) {
-  const data = payload?.data || {};
+  const data = payload?.data || payload || {};
   const metadata = data?.metadata || {};
-  const txId = metadata.transaction_id;
+  const txId = metadata.transaction_id || data.transaction_id;
   const ref = metadata.order_id || metadata.reference || data.reference;
 
   let tx = null;
@@ -745,27 +800,36 @@ export async function handleWebhookEvent(event, payload) {
 
   if (event === 'payment.success') {
     await applySuccessfulPayment(tx, data);
-    return { success: true, status: 'EN_ATTENTE' };
-  } else if (event === 'payment.failed') {
+    return { success: true, status: 'VALIDE' };
+  } else if (event === 'payment.failed' || event === 'payment.declined' || event === 'payment.rejected') {
+    const reason = data.failure_reason || data.error_message || data.decline_reason || 'Paiement rejeté par l’opérateur (solde insuffisant ou refus banque)';
     await pool.query(
-      `UPDATE transactions SET statut = 'ECHEC', updated_at = NOW() WHERE id = $1`,
-      [tx.id]
+      `UPDATE transactions SET statut = 'ECHEC', motif_rejet = $1, updated_at = NOW() WHERE id = $2`,
+      [reason, tx.id]
     );
     if (tx.donateur_user_id) {
       await notify(tx.donateur_user_id, {
         titre: 'Paiement non abouti',
-        message: `Le versement de ${Number(tx.montant).toLocaleString('fr-FR')} FCFA pour ${tx.titre} n'a pas abouti.`,
+        message: `Le versement de ${Number(tx.montant).toLocaleString('fr-FR')} FCFA pour ${tx.titre} a été refusé : ${reason}`,
         type: 'PAIEMENT',
         referenceId: tx.id,
       });
     }
     return { success: true, status: 'ECHEC' };
-  } else if (event === 'payment.cancelled' || event === 'payment.expired') {
+  } else if (event === 'payment.cancelled') {
+    const reason = data.failure_reason || 'Paiement annulé par le donateur.';
     await pool.query(
-      `UPDATE transactions SET statut = 'ANNULE', updated_at = NOW() WHERE id = $1`,
-      [tx.id]
+      `UPDATE transactions SET statut = 'ANNULE', motif_rejet = $1, updated_at = NOW() WHERE id = $2`,
+      [reason, tx.id]
     );
     return { success: true, status: 'ANNULE' };
+  } else if (event === 'payment.expired') {
+    const reason = 'Délai d’authentification de paiement expiré.';
+    await pool.query(
+      `UPDATE transactions SET statut = 'ECHEC', motif_rejet = $1, updated_at = NOW() WHERE id = $2`,
+      [reason, tx.id]
+    );
+    return { success: true, status: 'ECHEC' };
   }
 
   return { success: true, status: tx.statut };

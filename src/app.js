@@ -105,11 +105,13 @@ export function createApp() {
     const rawStatus = String(req.query.status || '').toLowerCase();
     const isSuccess = rawStatus === 'success';
     const ref = String(req.query.ref || '').trim();
+    const reason = String(req.query.reason || req.query.error_message || req.query.msg || '').trim();
+    const platform = String(req.query.platform || '').toLowerCase();
 
     let view = null;
     if (ref) {
       try {
-        view = await syncPaymentByReference(ref, rawStatus);
+        view = await syncPaymentByReference(ref, rawStatus, reason);
       } catch (err) {
         console.warn('[Paiement Retour Sync Warning]', err.message);
       }
@@ -122,20 +124,41 @@ export function createApp() {
       Boolean(view?.geniuspay_id || view?.geniuspay_reference);
     const isGatewayOk = isValide || isPendingTreasury || (isSuccess && Boolean(view?.recu_id));
     const recuId = view?.recu_id || '';
+    const txId = view?.id || '';
+    const targetReceiptId = recuId || txId;
+    const motifRejet = view?.motif_rejet || reason || '';
     const montantNum = view?.montant ? Number(view.montant) : null;
     const montantStr = montantNum ? `${montantNum.toLocaleString('fr-FR')} FCFA` : '';
     const titreStr = view?.titre || 'Contribution Financière';
     const numeroRecu = view?.numero_recu || '';
 
     // URL de redirection vers l'application mobile (deep link Expo scheme: jcvpay)
-    const deepLink = isGatewayOk
-      ? (recuId ? `jcvpay://recu/${recuId}?choix=1` : 'jcvpay://recus')
-      : `jcvpay://paiement?error=1&ref=${encodeURIComponent(ref)}`;
+    const deepLink = targetReceiptId
+      ? (isGatewayOk
+          ? `jcvpay://recu/${targetReceiptId}?choix=1`
+          : `jcvpay://recu/${targetReceiptId}?choix=1&error=1&motif=${encodeURIComponent(motifRejet)}`)
+      : (isGatewayOk ? 'jcvpay://recus' : `jcvpay://paiement?error=1&ref=${encodeURIComponent(ref)}&motif=${encodeURIComponent(motifRejet)}`);
 
     // URL de secours Web
-    const webUrl = isGatewayOk
-      ? (recuId ? `${config.clientUrl}/recu/${recuId}?choix=1` : `${config.clientUrl}/recus`)
-      : `${config.clientUrl}/paiement?error=1&ref=${encodeURIComponent(ref)}`;
+    const webUrl = targetReceiptId
+      ? (isGatewayOk
+          ? `${config.clientUrl}/recu/${targetReceiptId}?choix=1`
+          : `${config.clientUrl}/recu/${targetReceiptId}?choix=1&error=1&motif=${encodeURIComponent(motifRejet)}`)
+      : (isGatewayOk ? `${config.clientUrl}/recus` : `${config.clientUrl}/paiement?error=1&ref=${encodeURIComponent(ref)}&motif=${encodeURIComponent(motifRejet)}`);
+
+    // Redirection HTTP 302 immédiate pour éviter toute lenteur
+    const userAgent = req.headers['user-agent'] || '';
+    const isMobileDevice = /iphone|ipad|android|mobile/i.test(userAgent);
+    const preferRedirect = req.query.redirect !== '0' && req.query.noforward !== '1';
+
+    if (preferRedirect) {
+      if (platform === 'web') {
+        return res.redirect(302, webUrl);
+      }
+      if (platform === 'ios' || platform === 'android' || platform === 'mobile' || isMobileDevice) {
+        return res.redirect(302, deepLink);
+      }
+    }
 
     const pageTitle = isValide
       ? 'Paiement confirmé'
@@ -151,7 +174,7 @@ export function createApp() {
       ? 'Votre contribution a été validée avec succès. Votre reçu officiel a été généré et certifié.'
       : isPendingTreasury
         ? 'Votre paiement en ligne a bien été reçu. La trésorerie du Temple confirmera la réception avant la certification du reçu officiel.'
-        : 'La transaction n’a pas pu être validée ou a été annulée. Vous pouvez réessayer votre paiement.';
+        : (motifRejet || 'La transaction n’a pas pu être validée ou a été annulée. Vous pouvez réessayer votre paiement.');
     const iconChar = isValide ? '✓' : isPendingTreasury ? '⏳' : '✕';
     const toneOk = isValide;
     const tonePending = isPendingTreasury;
@@ -159,12 +182,12 @@ export function createApp() {
       ? '<span class="badge-ok">Validé</span>'
       : isPendingTreasury
         ? '<span class="badge-warn">En attente trésorerie</span>'
-        : '<span class="badge-err">Non validé</span>';
+        : '<span class="badge-err">Refusé / Non validé</span>';
     const primaryBtn = isValide
       ? 'Ouvrir mon reçu dans l’application'
       : isPendingTreasury
         ? 'Suivre mon versement dans l’application'
-        : 'Réessayer dans l’application';
+        : 'Voir les détails du reçu';
     const secondaryBtn = isValide
       ? 'Consulter le reçu sur le Web'
       : isPendingTreasury
@@ -195,15 +218,15 @@ export function createApp() {
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta http-equiv="refresh" content="0;url=${deepLink}">
         <title>JCV Pay — ${pageTitle}</title>
         <script>
-          // Tentative d'ouverture immédiate de l'application JCV Pay
           const deepLink = ${JSON.stringify(deepLink)};
           const webUrl = ${JSON.stringify(webUrl)};
           try {
-            window.location.href = deepLink;
+            window.location.replace(deepLink);
           } catch (e) {
-            console.warn(e);
+            window.location.href = deepLink;
           }
         </script>
         <style>

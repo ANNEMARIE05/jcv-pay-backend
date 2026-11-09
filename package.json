@@ -7,7 +7,11 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node scripts/test-totals-and-status.js && node scripts/test-payment-return-flow.js && node scripts/test-payment-refusal-cases.js",
+    "test:totals": "node scripts/test-totals-and-status.js",
+    "test:return": "node scripts/test-payment-return-flow.js",
+    "test:refusals": "node scripts/test-payment-refusal-cases.js"
   },
   "engines": {
     "node": ">=20"
