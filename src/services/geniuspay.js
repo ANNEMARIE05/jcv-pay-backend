@@ -1,7 +1,14 @@
 import crypto from 'crypto';
+import dns from 'dns';
+import tls from 'tls';
 import { config } from '../config.js';
 import { AppError } from '../errors.js';
 import { normalizePhone } from '../utils/phone.js';
+
+// Évite la fragmentation du TLS ClientHello (échange post-quantique ML-KEM de Node 24 / OpenSSL 3.5)
+// et force la résolution IPv4 en priorité vers Cloudflare (geniuspay.ci).
+dns.setDefaultResultOrder('ipv4first');
+tls.DEFAULT_ECDH_CURVE = 'X25519:prime256v1:secp384r1';
 
 const METHOD_MAP = {
   WAVE: 'wave',
@@ -51,17 +58,29 @@ async function geniusPayRequest(path, options = {}) {
     ...(options.headers || {}),
   };
 
-  const timeoutMs = options.timeoutMs || 10000;
+  const timeoutMs = options.timeoutMs || 15000;
   let response;
-  try {
-    response = await fetch(url, {
-      ...options,
-      headers,
-      signal: options.signal || AbortSignal.timeout(timeoutMs),
-    });
-  } catch (netErr) {
-    console.error('[GeniusPay Net Error]', netErr.message);
-    throw new AppError(502, `Connexion à GeniusPay impossible : ${netErr.message}`);
+  let lastNetErr = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      response = await fetch(url, {
+        ...options,
+        headers,
+        signal: options.signal || AbortSignal.timeout(timeoutMs),
+      });
+      lastNetErr = null;
+      break;
+    } catch (netErr) {
+      lastNetErr = netErr;
+      if (attempt < 2 && !options.signal) {
+        console.warn(`[GeniusPay Retry ${attempt}/2]`, netErr.message);
+        continue;
+      }
+    }
+  }
+  if (lastNetErr) {
+    console.error('[GeniusPay Net Error]', lastNetErr.message);
+    throw new AppError(502, `Connexion à GeniusPay impossible : ${lastNetErr.message}`);
   }
 
   let body;

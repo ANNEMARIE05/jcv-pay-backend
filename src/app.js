@@ -19,7 +19,7 @@ import {
   bodySizeGuard,
 } from './middleware/security.js';
 import { ipBlockMiddleware } from './services/audit.js';
-import { syncPaymentByReference } from './services/payments.js';
+import { loadPaymentView, syncPaymentByReference } from './services/payments.js';
 
 export function createApp() {
   const app = express();
@@ -100,6 +100,180 @@ export function createApp() {
       },
     })
   );
+
+  app.get('/paiement/sandbox', async (req, res) => {
+    const ref = String(req.query.ref || '').trim();
+    const platform = String(req.query.platform || 'mobile').trim();
+    const view = ref ? await loadPaymentView(ref).catch(() => null) : null;
+
+    const montantStr = view?.montant
+      ? `${Number(view.montant).toLocaleString('fr-FR')} FCFA`
+      : '5 000 FCFA';
+    const titreStr = view?.titre || 'Contribution Financière';
+    const donateurStr = view?.donateur_nom || 'Fidèle JCV';
+    const phoneStr = view?.donateur_telephone || '';
+    const moyenStr = view?.moyen_paiement || 'WAVE';
+
+    const successHref = `/paiement/retour?status=success&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}`;
+    const failHref = `/paiement/retour?status=error&ref=${encodeURIComponent(ref)}&reason=${encodeURIComponent('Solde insuffisant sur le compte Mobile Money')}&platform=${encodeURIComponent(platform)}`;
+    const cancelHref = `/paiement/retour?status=cancelled&ref=${encodeURIComponent(ref)}&platform=${encodeURIComponent(platform)}`;
+
+    res.type('html').send(`<!doctype html>
+      <html lang="fr">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>GeniusPay Sandbox — Paiement sécurisé</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0B1120;
+            color: #F8FAFC;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+          }
+          .card {
+            background: #151E32;
+            border: 1px solid #1E293B;
+            border-radius: 26px;
+            max-width: 440px;
+            width: 100%;
+            padding: 32px 24px;
+            text-align: center;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+          }
+          .badge-sandbox {
+            display: inline-block;
+            background: rgba(245, 158, 11, 0.16);
+            color: #FBBF24;
+            border: 1px solid rgba(245, 158, 11, 0.35);
+            padding: 5px 12px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 16px;
+          }
+          h1 {
+            font-size: 20px;
+            font-weight: 800;
+            color: #F8FAFC;
+            margin-bottom: 6px;
+          }
+          .merchant {
+            font-size: 13px;
+            color: #94A3B8;
+            margin-bottom: 18px;
+          }
+          .amount-box {
+            background: #0F172A;
+            border: 1px solid #1E293B;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 20px;
+          }
+          .amount-label {
+            font-size: 12px;
+            color: #64748B;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 4px;
+          }
+          .amount-val {
+            font-size: 28px;
+            font-weight: 800;
+            color: #34D399;
+          }
+          .info-table {
+            background: #0F172A;
+            border: 1px solid #1E293B;
+            border-radius: 16px;
+            padding: 14px 16px;
+            margin-bottom: 24px;
+            text-align: left;
+          }
+          .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 7px 0;
+            border-bottom: 1px solid #1E293B;
+            font-size: 13px;
+          }
+          .info-row:last-child { border-bottom: none; }
+          .info-label { color: #64748B; }
+          .info-value { color: #F1F5F9; font-weight: 600; text-align: right; }
+          .actions { display: flex; flex-direction: column; gap: 10px; }
+          .btn {
+            display: block;
+            width: 100%;
+            text-decoration: none;
+            padding: 14px 18px;
+            border-radius: 14px;
+            font-weight: 700;
+            font-size: 14px;
+          }
+          .btn-ok {
+            background: #10B981;
+            color: #FFFFFF;
+            box-shadow: 0 4px 14px rgba(16, 185, 129, 0.35);
+          }
+          .btn-fail {
+            background: rgba(239, 68, 68, 0.16);
+            color: #F87171;
+            border: 1px solid rgba(239, 68, 68, 0.35);
+          }
+          .btn-cancel {
+            background: transparent;
+            color: #94A3B8;
+            border: 1px solid #334155;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="badge-sandbox">Mode Test Sandbox • GeniusPay</div>
+          <h1>Église Jésus Christ Victoire</h1>
+          <div class="merchant">${titreStr}</div>
+
+          <div class="amount-box">
+            <div class="amount-label">Montant à régler</div>
+            <div class="amount-val">${montantStr}</div>
+          </div>
+
+          <div class="info-table">
+            <div class="info-row">
+              <span class="info-label">Moyen</span>
+              <span class="info-value">${moyenStr}</span>
+            </div>
+            <div class="info-row">
+              <span class="info-label">Donateur</span>
+              <span class="info-value">${donateurStr}</span>
+            </div>
+            ${phoneStr ? `
+            <div class="info-row">
+              <span class="info-label">Téléphone</span>
+              <span class="info-value">${phoneStr}</span>
+            </div>` : ''}
+            <div class="info-row">
+              <span class="info-label">Référence</span>
+              <span class="info-value" style="font-family: monospace;">${ref}</span>
+            </div>
+          </div>
+
+          <div class="actions">
+            <a class="btn btn-ok" href="${successHref}">✓ Confirmer le paiement (Succès)</a>
+            <a class="btn btn-fail" href="${failHref}">✕ Simuler un refus (Solde insuffisant)</a>
+            <a class="btn btn-cancel" href="${cancelHref}">Annuler la transaction</a>
+          </div>
+        </div>
+      </body>
+      </html>`);
+  });
 
   app.get('/paiement/retour', async (req, res) => {
     const rawStatus = String(req.query.status || '').toLowerCase();

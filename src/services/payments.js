@@ -273,43 +273,63 @@ export async function declarePayment(user, body, options = {}) {
     donateurMatricule: user.matricule,
   };
 
+  const isOnline = ['WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE'].includes(moyen);
+  if (isOnline && hasGeniusPayCredentials() && !options.skipGeniusPay && montant < 200) {
+    throw new AppError(400, 'Le montant minimum pour un paiement en ligne est de 200 FCFA.');
+  }
+
   const created = await withTx((client) =>
     insertPayment(client, { ...base, statut: 'EN_ATTENTE' })
   );
 
-  const isOnline = ['WAVE', 'ORANGE_MONEY', 'MTN_MOMO', 'MOOV_MONEY', 'CARTE_BANCAIRE'].includes(moyen);
   let checkoutUrl = null;
 
   if (isOnline && hasGeniusPayCredentials() && !options.skipGeniusPay) {
-    if (montant < 200) {
-      throw new AppError(400, 'Le montant minimum pour un paiement en ligne est de 200 FCFA.');
-    }
-
     try {
       const baseUrl = options.requestBaseUrl || config.publicBaseUrl;
       const platformParam = encodeURIComponent(options.platform || body.platform || 'mobile');
       const successUrl = `${baseUrl}/paiement/retour?status=success&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
       const errorUrl = `${baseUrl}/paiement/retour?status=error&ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`;
 
-      const gp = await createPayment({
-        amount: montant,
-        paymentMethod: moyen,
-        description: `${base.titre} — ${base.donateurNom}`,
-        customer: {
-          name: base.donateurNom,
-          email: base.donateurEmail,
-          phone: telephone,
-        },
-        metadata: {
-          transaction_id: created.transaction.id,
-          reference: created.transaction.reference,
-          order_id: created.transaction.reference,
-          donateur_user_id: user.id,
-          type: body.type,
-        },
-        successUrl,
-        errorUrl,
-      });
+      let gp;
+      try {
+        gp = await createPayment({
+          amount: montant,
+          paymentMethod: moyen,
+          description: `${base.titre} — ${base.donateurNom}`,
+          customer: {
+            name: base.donateurNom,
+            email: base.donateurEmail,
+            phone: telephone,
+          },
+          metadata: {
+            transaction_id: created.transaction.id,
+            reference: created.transaction.reference,
+            order_id: created.transaction.reference,
+            donateur_user_id: user.id,
+            type: body.type,
+          },
+          successUrl,
+          errorUrl,
+        });
+      } catch (apiErr) {
+        const isSandboxQuotaExhausted =
+          config.geniuspay.environment === 'sandbox' &&
+          /no tokens remaining|sandbox access denied/i.test(apiErr.message);
+        if (!isSandboxQuotaExhausted) {
+          throw apiErr;
+        }
+        const simRef = `SANDBOX_SIM_${created.transaction.reference}`;
+        console.warn(
+          `[GeniusPay Sandbox] Jetons Sandbox épuisés (0) — bascule sur le simulateur checkout local (${simRef}).`
+        );
+        gp = {
+          id: `sim_${Date.now()}`,
+          reference: simRef,
+          checkout_url: `${baseUrl}/paiement/sandbox?ref=${encodeURIComponent(created.transaction.reference)}&platform=${platformParam}`,
+          environment: 'sandbox',
+        };
+      }
 
       checkoutUrl = gp.checkout_url || gp.payment_url || null;
 
@@ -639,7 +659,11 @@ export async function syncPayment(user, id) {
     return presentTransaction(tx);
   }
 
-  if (tx.geniuspay_reference && hasGeniusPayCredentials()) {
+  if (
+    tx.geniuspay_reference &&
+    !String(tx.geniuspay_reference).startsWith('SANDBOX_SIM_') &&
+    hasGeniusPayCredentials()
+  ) {
     try {
       const gp = await getPayment(tx.geniuspay_reference, { timeoutMs: 3000 });
       if (gp && gp.status === 'completed') {
@@ -688,7 +712,8 @@ export async function syncPaymentByReference(reference, statusHint = null, reaso
         status: 'completed',
       });
       // Requête asynchrone non bloquante pour récupérer les détails de frais si besoin
-      const gpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+      const rawGpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+      const gpRef = rawGpRef && !String(rawGpRef).startsWith('SANDBOX_SIM_') ? rawGpRef : null;
       if (gpRef && hasGeniusPayCredentials()) {
         getPayment(gpRef, { timeoutMs: 1500 })
           .then((gp) => {
@@ -733,7 +758,8 @@ export async function syncPaymentByReference(reference, statusHint = null, reaso
   }
 
   // 3. Synchronisation via l'API GeniusPay avec timeout strict pour ne pas ralentir le retour
-  const gpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+  const rawGpRef = view.geniuspay_reference || (reference.startsWith('MTX-') ? null : reference);
+  const gpRef = rawGpRef && !String(rawGpRef).startsWith('SANDBOX_SIM_') ? rawGpRef : null;
   if (gpRef && hasGeniusPayCredentials()) {
     try {
       const gp = await getPayment(gpRef, { timeoutMs: 2500 });
